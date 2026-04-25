@@ -1,0 +1,212 @@
+/**
+ * Chatwoot webhook receiver. Chatwoot sends one POST per event; we only act
+ * on `message_created` with message_type=0 (incoming, from client). Anything
+ * else (outgoing, private notes, conversation_created, status_changed) we
+ * acknowledge with 200 and ignore.
+ *
+ * Normalization: Chatwoot's payload shape is verbose. We extract the fields
+ * we care about, persist to message_inbox, and enqueue a BullMQ job. The
+ * heavy lifting (transcription, orchestration) happens in the worker.
+ *
+ * Idempotency: Chatwoot may retry a webhook on 5xx. We dedupe by
+ * (chatwoot_message_id) — if a row with the same external_message_id already
+ * exists in messages, we skip.
+ */
+import type { FastifyInstance } from 'fastify';
+import { z } from 'zod';
+import { pool } from '../../persistence/db.js';
+import { enqueueMessageJob } from '../../queue/index.js';
+import { config } from '../../config.js';
+
+// Tolerant schema — Chatwoot evolves its payload; we want to accept what we
+// recognize and ignore the rest, never reject a well-formed message.
+const chatwootSenderSchema = z.object({
+  identifier: z.string().nullable().optional(),
+  phone_number: z.string().nullable().optional(),
+  name: z.string().nullable().optional(),
+}).passthrough();
+
+const chatwootAttachmentSchema = z.object({
+  file_type: z.string().optional(),
+  data_url: z.string().optional(),
+  file_size: z.number().optional(),
+}).passthrough();
+
+const chatwootMessagePayloadSchema = z.object({
+  event: z.string().optional(),
+  id: z.union([z.number(), z.string()]).optional(),
+  content: z.string().nullable().optional(),
+  message_type: z.union([z.number(), z.string()]).optional(),
+  content_type: z.string().optional(),
+  source_id: z.string().nullable().optional(),
+  private: z.boolean().optional(),
+  sender: chatwootSenderSchema.optional(),
+  conversation: z
+    .object({
+      id: z.union([z.number(), z.string()]).optional(),
+      contact_inbox: z
+        .object({
+          source_id: z.string().nullable().optional(),
+        })
+        .passthrough()
+        .optional(),
+      meta: z
+        .object({
+          sender: chatwootSenderSchema.optional(),
+        })
+        .passthrough()
+        .optional(),
+    })
+    .passthrough()
+    .optional(),
+  attachments: z.array(chatwootAttachmentSchema).optional(),
+}).passthrough();
+
+interface NormalizedInbound {
+  channel: 'chatwoot';
+  conversationId: string; // wa_id (phone) — our PK
+  externalMessageId: string | undefined; // wamid if available, else chatwoot id
+  chatwootMessageId: string | undefined;
+  chatwootConversationId: number | undefined;
+  clientName: string | undefined;
+  text: string | undefined;
+  media:
+    | {
+        url: string;
+        mimeType: string;
+        durationSec?: number;
+      }
+    | undefined;
+}
+
+function isIncomingMessage(payload: z.infer<typeof chatwootMessagePayloadSchema>): boolean {
+  // Chatwoot uses 0 for incoming, 1 for outgoing. Some payloads stringify it.
+  if (payload.event && payload.event !== 'message_created') return false;
+  if (payload.private === true) return false;
+  const mt = payload.message_type;
+  if (mt === 0 || mt === '0' || mt === 'incoming') return true;
+  return false;
+}
+
+function pickWaId(payload: z.infer<typeof chatwootMessagePayloadSchema>): string | null {
+  const sender = payload.sender ?? payload.conversation?.meta?.sender;
+  // Prefer identifier (Meta WhatsApp uses it as wa_id, e.g. "573001234567")
+  if (sender?.identifier && /^\d+$/.test(sender.identifier)) return sender.identifier;
+  // Fallback: phone_number minus the "+"
+  if (sender?.phone_number) {
+    const cleaned = sender.phone_number.replace(/[^\d]/g, '');
+    if (cleaned.length >= 10) return cleaned;
+  }
+  return null;
+}
+
+function pickMedia(
+  payload: z.infer<typeof chatwootMessagePayloadSchema>,
+): NormalizedInbound['media'] {
+  const att = payload.attachments?.[0];
+  if (!att?.data_url) return undefined;
+  // Chatwoot file_type values: image, audio, video, file, location, contact
+  const mimeMap: Record<string, string> = {
+    audio: 'audio/ogg',
+    image: 'image/jpeg',
+    video: 'video/mp4',
+    file: 'application/octet-stream',
+  };
+  const mimeType = att.file_type ? mimeMap[att.file_type] ?? 'application/octet-stream' : 'application/octet-stream';
+  return { url: att.data_url, mimeType };
+}
+
+function normalize(
+  payload: z.infer<typeof chatwootMessagePayloadSchema>,
+): NormalizedInbound | { skip: true; reason: string } {
+  if (!isIncomingMessage(payload)) {
+    return { skip: true, reason: `event=${payload.event ?? '?'} message_type=${payload.message_type ?? '?'}` };
+  }
+  const waId = pickWaId(payload);
+  if (!waId) return { skip: true, reason: 'cannot resolve wa_id from sender' };
+
+  const sender = payload.sender ?? payload.conversation?.meta?.sender;
+  const chatwootMessageId =
+    payload.id != null ? String(payload.id) : undefined;
+  const conversationId =
+    payload.conversation?.id != null ? Number(payload.conversation.id) : undefined;
+
+  const sourceId =
+    payload.source_id && payload.source_id.startsWith('wamid.') ? payload.source_id : undefined;
+
+  return {
+    channel: 'chatwoot',
+    conversationId: waId,
+    externalMessageId: sourceId ?? chatwootMessageId,
+    chatwootMessageId,
+    chatwootConversationId: conversationId,
+    clientName: sender?.name ?? undefined,
+    text: payload.content ?? undefined,
+    media: pickMedia(payload),
+  };
+}
+
+export async function chatwootWebhookRoutes(app: FastifyInstance) {
+  app.post('/chatwoot', async (req, reply) => {
+    // Optional shared-secret check for Chatwoot. Configure via WEBHOOK_SHARED_SECRET
+    // and set the same value as the Chatwoot webhook header.
+    if (config.WEBHOOK_SHARED_SECRET) {
+      const got = req.headers['x-webhook-secret'];
+      if (got !== config.WEBHOOK_SHARED_SECRET) {
+        return reply.unauthorized('invalid webhook secret');
+      }
+    }
+
+    const parsed = chatwootMessagePayloadSchema.safeParse(req.body);
+    if (!parsed.success) {
+      req.log.warn({ issues: parsed.error.issues }, 'invalid chatwoot payload — acking with 200 to prevent retries');
+      return reply.send({ ok: true, ignored: true, reason: 'invalid payload' });
+    }
+
+    const normalized = normalize(parsed.data);
+    if ('skip' in normalized) {
+      req.log.info({ reason: normalized.reason }, 'chatwoot event skipped');
+      return reply.send({ ok: true, ignored: true, reason: normalized.reason });
+    }
+
+    // Idempotency: if we already have a message with this external_message_id,
+    // skip (Chatwoot retried).
+    if (normalized.externalMessageId) {
+      const existing = await pool.query(
+        `SELECT id FROM messages WHERE external_message_id = $1 LIMIT 1`,
+        [normalized.externalMessageId],
+      );
+      if (existing.rows.length > 0) {
+        req.log.info({ externalMessageId: normalized.externalMessageId }, 'duplicate chatwoot webhook — already processed');
+        return reply.send({ ok: true, duplicate: true });
+      }
+    }
+
+    // Upsert conversation with chatwoot_conversation_id link
+    await pool.query(
+      `INSERT INTO conversations (wa_id, chatwoot_conversation_id, client_name)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (wa_id) DO UPDATE SET
+           chatwoot_conversation_id = COALESCE(EXCLUDED.chatwoot_conversation_id, conversations.chatwoot_conversation_id),
+           client_name = COALESCE(EXCLUDED.client_name, conversations.client_name)`,
+      [normalized.conversationId, normalized.chatwootConversationId ?? null, normalized.clientName ?? null],
+    );
+
+    const inserted = await pool.query<{ id: string }>(
+      `INSERT INTO message_inbox (conversation_id, payload)
+         VALUES ($1, $2::jsonb)
+         RETURNING id`,
+      [normalized.conversationId, JSON.stringify(normalized)],
+    );
+    const inboxId = inserted.rows[0]?.id;
+    if (!inboxId) throw new Error('failed to persist chatwoot inbox row');
+
+    await enqueueMessageJob({
+      inboxId,
+      conversationId: normalized.conversationId,
+      enqueuedAt: new Date().toISOString(),
+    });
+
+    return reply.send({ ok: true, inboxId });
+  });
+}

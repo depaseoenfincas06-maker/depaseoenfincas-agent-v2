@@ -1,0 +1,88 @@
+# Render.com one-shot deployment.
+# Push this repo to Render via "Blueprint" → it provisions web + worker +
+# Redis with the right environment in a single click.
+#
+# Postgres: we use Supabase (set DATABASE_URL as a secret env var).
+# To use Render Postgres instead, add a `databases:` block.
+
+services:
+  - type: web
+    name: depf-agent-server
+    runtime: docker
+    dockerfilePath: ./apps/agent/Dockerfile
+    plan: starter
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: AGENT_HTTP_PORT
+        value: 3200
+      - key: REDIS_URL
+        fromService:
+          type: redis
+          name: depf-redis
+          property: connectionString
+      - key: DATABASE_URL
+        sync: false        # set in Render UI (Supabase pooler URL)
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: CHATWOOT_BASE_URL
+        sync: false
+      - key: CHATWOOT_ACCOUNT_ID
+        sync: false
+      - key: CHATWOOT_API_TOKEN
+        sync: false
+      - key: WHATSAPP_PHONE_NUMBER_ID
+        sync: false
+      - key: WHATSAPP_OWNER_PHONE_NUMBER_ID
+        sync: false
+      - key: WHATSAPP_ACCESS_TOKEN
+        sync: false
+      - key: INVENTORY_SHEET_DOCUMENT_ID
+        sync: false
+      - key: INVENTORY_SHEET_TAB_NAME
+        sync: false
+      - key: WEBHOOK_SHARED_SECRET
+        generateValue: true
+
+  - type: worker
+    name: depf-agent-worker
+    runtime: docker
+    dockerfilePath: ./apps/agent/Dockerfile
+    dockerCommand: node apps/agent/dist/workers/message-worker.js
+    plan: starter
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: REDIS_URL
+        fromService:
+          type: redis
+          name: depf-redis
+          property: connectionString
+      - key: DATABASE_URL
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: CHATWOOT_BASE_URL
+        sync: false
+      - key: CHATWOOT_API_TOKEN
+        sync: false
+      - key: WHATSAPP_PHONE_NUMBER_ID
+        sync: false
+      - key: WHATSAPP_OWNER_PHONE_NUMBER_ID
+        sync: false
+      - key: WHATSAPP_ACCESS_TOKEN
+        sync: false
+      - key: INVENTORY_SHEET_DOCUMENT_ID
+        sync: false
+      - key: INVENTORY_SHEET_TAB_NAME
+        sync: false
+
+  - type: redis
+    name: depf-redis
+    plan: starter
+    ipAllowList: []  # only internal services
