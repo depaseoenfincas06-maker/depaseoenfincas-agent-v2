@@ -2,7 +2,7 @@ import { Queue, QueueEvents } from 'bullmq';
 import { redis } from './connection.js';
 import { logger } from '../observability/logger.js';
 
-export const MESSAGE_QUEUE_NAME = 'depf:messages';
+export const MESSAGE_QUEUE_NAME = 'depf-messages';
 
 export interface MessageJob {
   /** message_inbox.id */

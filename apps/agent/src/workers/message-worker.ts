@@ -16,6 +16,9 @@ import { logger } from '../observability/logger.js';
 import { lockConversation } from '../persistence/conversation-lock.js';
 import { pool } from '../persistence/db.js';
 import { orchestrator } from '../agent/orchestrator.js';
+import { transcribe, buildDomainPrompt } from '../media/transcribe.js';
+import { downloadMedia } from '../media/download.js';
+import { loadFincas } from '../inventory/loader.js';
 import type { Channel, TranscriptionStatus } from '@depf/shared';
 
 interface InboundPayload {
@@ -46,12 +49,49 @@ async function processJob(job: { id?: string; data: MessageJob }) {
     const payload = inboxRow.rows[0]?.payload;
     if (!payload) throw new Error(`inbox row missing: ${inboxId}`);
 
+    // Audio handling: if the inbound has media that looks like audio AND
+    // text wasn't already provided, download and transcribe it BEFORE
+    // entering the orchestrator. This way the agent only ever sees text
+    // (or an explicit empty/failed flag) — never a half-baked audio.
+    let text = payload.text ?? null;
+    let transcriptionStatus: TranscriptionStatus = payload.transcriptionStatus ?? null;
+    if (payload.media?.url && (!text || text.trim().length === 0) && /audio|video/.test(payload.media.mimeType)) {
+      try {
+        const media = await downloadMedia(payload.media.url, payload.media.mimeType);
+        const fincas = await loadFincas().catch(() => []);
+        const domainPrompt = buildDomainPrompt({
+          fincaCodes: fincas.map((f) => f.fincaId),
+        });
+        const tr = await transcribe(
+          {
+            buffer: media.buffer,
+            mimeType: media.mimeType,
+            filename: payload.media.filename ?? media.filename,
+            durationSec: payload.media.durationSec ?? null,
+          },
+          { domainPrompt, language: 'es' },
+        );
+        transcriptionStatus = tr.status;
+        if (tr.ok) text = tr.text;
+        log.info(
+          {
+            transcriptionStatus,
+            attempts: tr.attempts.map((a) => ({ model: a.model, ok: a.ok, latencyMs: a.latencyMs })),
+          },
+          'transcription complete',
+        );
+      } catch (err) {
+        log.error({ err }, 'transcription pipeline failed');
+        transcriptionStatus = 'failed';
+      }
+    }
+
     const result = await orchestrator.run({
       channel: payload.channel,
       conversationId,
       externalMessageId: payload.externalMessageId,
-      text: payload.text ?? null,
-      transcriptionStatus: payload.transcriptionStatus ?? null,
+      text,
+      transcriptionStatus,
       mediaUrl: payload.media?.url,
       mediaMimeType: payload.media?.mimeType,
       mediaDurationSec: payload.media?.durationSec,

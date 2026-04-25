@@ -5,6 +5,7 @@ import { config } from '../config.js';
 import { logger } from '../observability/logger.js';
 import { pool } from '../persistence/db.js';
 import { webhookRoutes } from './routes/webhook.js';
+import { adminRoutes } from './routes/admin.js';
 
 async function buildServer() {
   const app = Fastify({ loggerInstance: logger, disableRequestLogging: false });
@@ -21,7 +22,7 @@ async function buildServer() {
   });
 
   await app.register(webhookRoutes, { prefix: '/webhook' });
-  // Admin/dashboard routes registered in a later phase.
+  await app.register(adminRoutes, { prefix: '/api' });
 
   return app;
 }

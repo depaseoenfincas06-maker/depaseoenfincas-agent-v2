@@ -1,4 +1,13 @@
 import { z } from 'zod';
+import { config as loadDotenv } from 'dotenv';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+// __dirname is apps/agent/src — repo root is 3 levels up
+loadDotenv({ path: path.resolve(__dirname, '../../../.env'), quiet: true });
+loadDotenv({ path: path.resolve(__dirname, '../.env'), quiet: true });
+loadDotenv({ quiet: true });
 
 const envSchema = z.object({
   NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
@@ -26,7 +35,16 @@ const envSchema = z.object({
   CHATWOOT_API_TOKEN: z.string().optional(),
   CHATWOOT_INBOX_ID: z.coerce.number().int().positive().optional(),
 
+  /**
+   * Client-facing WhatsApp number (the main agent). Currently +57 310 5639334.
+   * Used to: receive inbound messages, show typing indicator, send media.
+   */
   WHATSAPP_PHONE_NUMBER_ID: z.string().optional(),
+  /**
+   * Owner-facing WhatsApp number, used to verify finca availability with
+   * property owners. Currently +1 205-583-7827 (formerly Kapso main).
+   */
+  WHATSAPP_OWNER_PHONE_NUMBER_ID: z.string().optional(),
   WHATSAPP_ACCESS_TOKEN: z.string().optional(),
   WHATSAPP_VERIFY_TOKEN: z.string().optional(),
 

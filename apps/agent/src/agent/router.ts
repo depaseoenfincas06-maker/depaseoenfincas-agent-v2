@@ -13,6 +13,8 @@
  */
 import { z } from 'zod';
 import type { Stage, ConversationContext } from '@depf/shared';
+import { getLLM } from './llm/index.js';
+import { Trace } from '../observability/tracer.js';
 
 export type RouteDestination = 'qa' | 'hitl' | 'stage';
 
@@ -61,7 +63,7 @@ export function applyDeterministicRules(text: string): RouteDecision | null {
   return null;
 }
 
-export const llmRouterSchema = z.object({
+const llmRouterSchema = z.object({
   destination: z.enum(['qa', 'hitl', 'stage']),
   reason: z.string(),
 });
@@ -70,19 +72,41 @@ export interface RouterContext {
   text: string;
   stage: Stage;
   conversation: ConversationContext;
+  trace: Trace;
 }
 
 /**
- * Build the prompt for the LLM router. Kept compact — the router is called
- * on every inbound, so token efficiency matters.
+ * LLM fallback router — called only when deterministic rules don't match.
+ * Always returns a valid destination thanks to schema validation; if the
+ * LLM call fails, we default to 'stage' (let current stage handle it),
+ * never to a silent state.
  */
-export function buildRouterPrompt(ctx: RouterContext) {
-  return [
+export async function applyLLMRouter(ctx: RouterContext): Promise<RouteDecision> {
+  let llm;
+  try {
+    llm = getLLM();
+  } catch (err) {
+    await ctx.trace.recordTurn({
+      stage: 'router',
+      model: 'unknown',
+      prompt: { text: ctx.text },
+      response: null,
+      toolsCalled: [],
+      tokensIn: null,
+      tokensOut: null,
+      costUsd: null,
+      latencyMs: null,
+      status: 'error',
+      errorDetail: { message: err instanceof Error ? err.message : String(err) },
+    });
+    return { destination: 'stage', reason: 'LLM not configured', confidence: 'llm' };
+  }
+  const messages = [
     {
       role: 'system' as const,
       content: `Eres un router que decide a quién enviar el siguiente mensaje del cliente. Devuelve SOLO un JSON con {"destination": "qa"|"hitl"|"stage", "reason": "..."}.
 Reglas:
-- "qa": pregunta puntual de información (precios, mascotas, ubicación, qué incluye, documentos de empresa, horarios). NO toques el flujo principal.
+- "qa": pregunta puntual de información (precios, mascotas, ubicación, qué incluye, documentos de empresa, horarios). NO toca el flujo principal.
 - "hitl": el cliente pide humano explícitamente, está furioso, amenaza, hay disputa de pagos.
 - "stage": cualquier otra cosa — sigue el flujo del stage actual.
 Stage actual: ${ctx.stage}.`,
@@ -92,4 +116,42 @@ Stage actual: ${ctx.stage}.`,
       content: ctx.text,
     },
   ];
+  try {
+    const result = await llm.generate({
+      name: 'intent-router',
+      messages,
+      schema: llmRouterSchema,
+      temperature: 0,
+      maxTokens: 200,
+    });
+    await ctx.trace.recordTurn({
+      stage: 'router',
+      model: result.model,
+      prompt: messages,
+      response: result.data,
+      toolsCalled: [],
+      tokensIn: result.usage.tokensIn,
+      tokensOut: result.usage.tokensOut,
+      costUsd: result.usage.costUsd,
+      latencyMs: result.latencyMs,
+      status: 'ok',
+    });
+    return { ...result.data, confidence: 'llm' };
+  } catch (err) {
+    await ctx.trace.recordTurn({
+      stage: 'router',
+      model: 'unknown',
+      prompt: messages,
+      response: null,
+      toolsCalled: [],
+      tokensIn: null,
+      tokensOut: null,
+      costUsd: null,
+      latencyMs: null,
+      status: 'error',
+      errorDetail: { message: err instanceof Error ? err.message : String(err) },
+    });
+    // Fail-open to stage — never silently drop the message.
+    return { destination: 'stage', reason: 'router LLM failed, defaulting to stage', confidence: 'llm' };
+  }
 }

@@ -19,8 +19,8 @@ import type {
   OutboundMessage,
   TranscriptionStatus,
 } from '@depf/shared';
-import { applyDeterministicRules } from './router.js';
-import { getStageHandler } from './stages/index.js';
+import { applyDeterministicRules, applyLLMRouter } from './router.js';
+import { getStageHandler, qaStage } from './stages/index.js';
 import type { StageInput, AgentSettingsView } from './stages/types.js';
 import { Trace } from '../observability/tracer.js';
 import { applyAlwaysRespondGuard } from '../observability/fallback-guard.js';
@@ -65,6 +65,67 @@ export class Orchestrator {
       stageBefore: conversation.currentStage,
     });
 
+    try {
+      return await this.runInner(envelope, conversation, settings, recent, trace, log);
+    } catch (err) {
+      log.error({ err }, 'orchestrator run failed catastrophically — emitting fallback');
+      // Last-resort fallback: even if everything broke, emit a message and
+      // record the failure. We never let an inbound disappear into the void.
+      try {
+        const guard = await applyAlwaysRespondGuard({
+          trace,
+          conversationId: envelope.conversationId,
+          channel: envelope.channel,
+          outbound: [],
+          silenceReason: null,
+          fallbackReason: 'STAGE_HANDLER_THREW',
+          context: {
+            error: err instanceof Error ? err.message : String(err),
+            stack: err instanceof Error ? err.stack?.split('\n').slice(0, 5) : undefined,
+          },
+        });
+        await this.deliverOutbound(envelope.conversationId, guard.outbound, trace.id).catch(() => {});
+        await trace.finalize({
+          stageAfter: conversation.currentStage,
+          intent: null,
+          outboundCount: guard.outbound.length,
+          status: 'fallback',
+          errorDetail: { message: err instanceof Error ? err.message : String(err) },
+        });
+        return {
+          traceId: trace.id,
+          status: 'fallback',
+          outboundCount: guard.outbound.length,
+        };
+      } catch (innerErr) {
+        // If even the fallback path fails, mark the trace as error and rethrow
+        // so BullMQ records it.
+        log.error({ err: innerErr }, 'fallback path itself failed');
+        await trace
+          .finalize({
+            stageAfter: conversation.currentStage,
+            intent: null,
+            outboundCount: 0,
+            status: 'error',
+            errorDetail: {
+              message: err instanceof Error ? err.message : String(err),
+              fallbackError: innerErr instanceof Error ? innerErr.message : String(innerErr),
+            },
+          })
+          .catch(() => {});
+        throw err;
+      }
+    }
+  }
+
+  private async runInner(
+    envelope: InboundEnvelope,
+    conversation: ConversationContext,
+    settings: AgentSettingsView,
+    recent: Array<{ role: 'user' | 'assistant'; content: string; createdAt: string }>,
+    trace: Trace,
+    log: { info: (...args: unknown[]) => void; error: (...args: unknown[]) => void; warn: (...args: unknown[]) => void },
+  ): Promise<OrchestratorResult> {
     // Short-circuit: HITL active → silence
     if (!conversation.agenteActivo) {
       await trace.finalize({
@@ -120,58 +181,46 @@ export class Orchestrator {
       return { traceId: trace.id, status: 'fallback', outboundCount: guard.outbound.length };
     }
 
-    // 2. Route
+    // 2. Route — deterministic regex first, LLM classifier as fallback.
     const ruleRoute = applyDeterministicRules(userText);
+    const route =
+      ruleRoute ??
+      (await applyLLMRouter({
+        text: userText,
+        stage: conversation.currentStage,
+        conversation,
+        trace,
+      }));
+
     let outbound: OutboundMessage[] = [];
     let nextStage: Stage = conversation.currentStage;
     let intent: Intent | null = null;
+    let extractedData: Record<string, unknown> = {};
     let fallbackReason: 'STAGE_HANDLER_THREW' | 'TOOL_LOOP_EXHAUSTED' | undefined;
 
     try {
-      // For now: only deterministic rules are wired. LLM router classifier is
-      // implemented in router.ts but we'll plug it in once QA stage exists.
-      if (ruleRoute?.destination === 'hitl') {
-        nextStage = 'HITL';
-        intent = 'HITL_REQUEST';
-        outbound = [
-          {
-            channel: envelope.channel,
-            type: 'text',
-            text:
-              settings.handoffMessage ??
-              'Te paso con un asesor humano para que te atienda mejor.',
-          },
-        ];
-      } else if (ruleRoute?.destination === 'qa') {
-        // QA stage not yet implemented — fall through to stage handler for now,
-        // but mark in the trace context that we'd have routed to QA.
-        log.info({ topic: ruleRoute.reason }, 'rule routed to qa (not yet implemented)');
-        const decision = await this.runStage(conversation.currentStage, {
-          userText,
-          recentMessages: recent,
-          conversation,
-          settings,
-          trace,
-        });
-        intent = decision.intent;
-        nextStage = decision.nextStage;
-        outbound = decision.outbound.map(
-          (m: OutboundMessage): OutboundMessage => ({ ...m, channel: envelope.channel }),
-        );
+      const stageInput: StageInput = {
+        userText,
+        recentMessages: recent,
+        conversation,
+        settings,
+        trace,
+      };
+      let decision;
+      if (route.destination === 'hitl') {
+        decision = await getStageHandler('HITL').handle(stageInput);
+      } else if (route.destination === 'qa') {
+        log.info({ reason: route.reason, confidence: route.confidence }, 'routed to QA');
+        decision = await qaStage.handle(stageInput);
       } else {
-        const decision = await this.runStage(conversation.currentStage, {
-          userText,
-          recentMessages: recent,
-          conversation,
-          settings,
-          trace,
-        });
-        intent = decision.intent;
-        nextStage = decision.nextStage;
-        outbound = decision.outbound.map(
-          (m: OutboundMessage): OutboundMessage => ({ ...m, channel: envelope.channel }),
-        );
+        decision = await this.runStage(conversation.currentStage, stageInput);
       }
+      intent = decision.intent;
+      nextStage = decision.nextStage;
+      extractedData = decision.extractedData ?? {};
+      outbound = decision.outbound.map(
+        (m: OutboundMessage): OutboundMessage => ({ ...m, channel: envelope.channel }),
+      );
     } catch (err) {
       log.error({ err }, 'stage handler threw');
       fallbackReason = 'STAGE_HANDLER_THREW';
@@ -204,8 +253,9 @@ export class Orchestrator {
     // 4. Deliver outbound
     await this.deliverOutbound(envelope.conversationId, guard.outbound, trace.id);
 
-    // 5. Persist conversation update
-    await this.persistConversationUpdate(envelope.conversationId, nextStage);
+    // 5. Persist conversation update — merge extracted_data into search_criteria
+    // and reservation as appropriate.
+    await this.persistConversationUpdate(envelope.conversationId, nextStage, extractedData);
 
     await trace.finalize({
       stageAfter: nextStage,
@@ -380,13 +430,60 @@ export class Orchestrator {
   private async persistConversationUpdate(
     conversationId: string,
     nextStage: Stage,
+    extractedData: Record<string, unknown>,
   ): Promise<void> {
+    // Split extracted_data into searchCriteria fields vs reservation fields.
+    const criteriaKeys = new Set([
+      'fechaInicio',
+      'fechaFin',
+      'personas',
+      'zona',
+      'ciudad',
+      'presupuestoMax',
+      'tipoEvento',
+      'amenidades',
+      'mascotas',
+    ]);
+    const reservationKeys = new Set([
+      'nombreCompleto',
+      'tipoDocumento',
+      'numeroDocumento',
+      'celular',
+      'email',
+      'direccion',
+    ]);
+    const criteriaPatch: Record<string, unknown> = {};
+    const reservationPatch: Record<string, unknown> = {};
+    let chosenFincaId: string | undefined;
+    for (const [k, v] of Object.entries(extractedData)) {
+      if (v == null) continue;
+      if (criteriaKeys.has(k)) criteriaPatch[k] = v;
+      else if (reservationKeys.has(k)) reservationPatch[k] = v;
+      else if (k === 'finca_elegida_id' || k === 'fincaId' || k === 'selectedFinca') {
+        chosenFincaId = String(v);
+      }
+    }
+
     await query(
       `UPDATE conversations
           SET current_stage = $2,
+              search_criteria = COALESCE(search_criteria, '{}'::jsonb) || $3::jsonb,
+              reservation = COALESCE(reservation, '{}'::jsonb) || $4::jsonb,
+              selected_finca = COALESCE($5, selected_finca),
+              shown_fincas = CASE
+                WHEN $5 IS NOT NULL AND NOT ($5 = ANY(shown_fincas))
+                  THEN array_append(shown_fincas, $5)
+                ELSE shown_fincas
+              END,
               agente_activo = CASE WHEN $2 = 'HITL' THEN false ELSE agente_activo END
         WHERE wa_id = $1`,
-      [conversationId, nextStage],
+      [
+        conversationId,
+        nextStage,
+        JSON.stringify(criteriaPatch),
+        JSON.stringify(reservationPatch),
+        chosenFincaId ?? null,
+      ],
     );
   }
 }
