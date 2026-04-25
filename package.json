@@ -1,0 +1,36 @@
+{
+  "name": "depaseoenfincas-agent",
+  "version": "0.1.0",
+  "private": true,
+  "description": "De Paseo en Fincas — conversational agent (rewrite without n8n)",
+  "engines": {
+    "node": ">=20.10.0",
+    "pnpm": ">=10.0.0"
+  },
+  "packageManager": "pnpm@10.33.2",
+  "scripts": {
+    "dev": "pnpm -r --parallel dev",
+    "build": "pnpm -r build",
+    "lint": "pnpm -r lint",
+    "typecheck": "pnpm -r typecheck",
+    "test": "pnpm -r test",
+    "agent:dev": "pnpm --filter @depf/agent dev",
+    "agent:worker": "pnpm --filter @depf/agent worker",
+    "dashboard:dev": "pnpm --filter @depf/dashboard dev",
+    "db:migrate": "pnpm --filter @depf/agent db:migrate",
+    "db:seed": "pnpm --filter @depf/agent db:seed",
+    "evals": "pnpm --filter @depf/agent evals",
+    "infra:up": "docker compose up -d",
+    "infra:down": "docker compose down",
+    "infra:logs": "docker compose logs -f"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.2",
+    "tsx": "^4.19.2",
+    "prettier": "^3.4.2",
+    "eslint": "^9.17.0",
+    "@typescript-eslint/eslint-plugin": "^8.18.0",
+    "@typescript-eslint/parser": "^8.18.0"
+  }
+}

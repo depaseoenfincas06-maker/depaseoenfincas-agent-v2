@@ -1,0 +1,57 @@
+import { z } from 'zod';
+
+const envSchema = z.object({
+  NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
+  LOG_LEVEL: z.enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace']).default('info'),
+  AGENT_HTTP_PORT: z.coerce.number().int().positive().default(3200),
+
+  DATABASE_URL: z.string().min(1),
+  DATABASE_POOL_MAX: z.coerce.number().int().positive().default(10),
+
+  REDIS_URL: z.string().min(1),
+  QUEUE_CONCURRENCY: z.coerce.number().int().positive().default(5),
+
+  LLM_PROVIDER: z.enum(['gemini', 'anthropic']).default('gemini'),
+  GEMINI_API_KEY: z.string().optional(),
+  GEMINI_MODEL: z.string().default('gemini-flash-latest'),
+  ANTHROPIC_API_KEY: z.string().optional(),
+  ANTHROPIC_MODEL: z.string().default('claude-sonnet-4-5'),
+
+  OPENAI_API_KEY: z.string().optional(),
+  OPENAI_TRANSCRIPTION_MODEL: z.string().default('gpt-4o-transcribe'),
+  OPENAI_TRANSCRIPTION_FALLBACK_MODEL: z.string().default('whisper-1'),
+
+  CHATWOOT_BASE_URL: z.string().url().optional(),
+  CHATWOOT_ACCOUNT_ID: z.coerce.number().int().positive().default(1),
+  CHATWOOT_API_TOKEN: z.string().optional(),
+  CHATWOOT_INBOX_ID: z.coerce.number().int().positive().optional(),
+
+  WHATSAPP_PHONE_NUMBER_ID: z.string().optional(),
+  WHATSAPP_ACCESS_TOKEN: z.string().optional(),
+  WHATSAPP_VERIFY_TOKEN: z.string().optional(),
+
+  INVENTORY_SHEET_DOCUMENT_ID: z.string().optional(),
+  INVENTORY_SHEET_TAB_NAME: z.string().default('fincas_inventory_ajustada_real'),
+  GOOGLE_SERVICE_ACCOUNT_JSON: z.string().optional(),
+
+  WEBHOOK_SHARED_SECRET: z.string().optional(),
+  SENTRY_DSN: z.string().optional(),
+});
+
+export type Config = z.infer<typeof envSchema>;
+
+let cached: Config | null = null;
+
+export function loadConfig(): Config {
+  if (cached) return cached;
+  const parsed = envSchema.safeParse(process.env);
+  if (!parsed.success) {
+    // eslint-disable-next-line no-console
+    console.error('Invalid environment configuration:', parsed.error.format());
+    throw new Error('Invalid environment configuration');
+  }
+  cached = parsed.data;
+  return cached;
+}
+
+export const config = loadConfig();

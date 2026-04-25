@@ -1,0 +1,394 @@
+/**
+ * Orchestrator: the single entry point used by the message worker. Given a
+ * persisted inbound message, runs the full turn:
+ *
+ *   1. Hydrate conversation context + settings + recent history
+ *   2. If the inbound is an empty audio → fallback message + return
+ *   3. Route to QA / HITL / stage handler
+ *   4. Apply always-respond guard
+ *   5. Persist outbound + update conversation state
+ *
+ * Errors in stage handlers don't crash the worker — they emit a fallback
+ * outbound and finalize the trace as 'fallback'.
+ */
+import type {
+  Channel,
+  ConversationContext,
+  Stage,
+  Intent,
+  OutboundMessage,
+  TranscriptionStatus,
+} from '@depf/shared';
+import { applyDeterministicRules } from './router.js';
+import { getStageHandler } from './stages/index.js';
+import type { StageInput, AgentSettingsView } from './stages/types.js';
+import { Trace } from '../observability/tracer.js';
+import { applyAlwaysRespondGuard } from '../observability/fallback-guard.js';
+import { logger } from '../observability/logger.js';
+import { withTx, query } from '../persistence/db.js';
+import { getChannel } from '../channels/index.js';
+
+interface InboundEnvelope {
+  channel: Channel;
+  conversationId: string;
+  externalMessageId?: string;
+  text: string | null;
+  transcriptionStatus: TranscriptionStatus;
+  mediaUrl?: string;
+  mediaMimeType?: string;
+  mediaDurationSec?: number;
+  inboxId: string;
+}
+
+export interface OrchestratorResult {
+  traceId: string;
+  status: 'ok' | 'silent' | 'fallback' | 'error';
+  outboundCount: number;
+}
+
+export class Orchestrator {
+  async run(envelope: InboundEnvelope): Promise<OrchestratorResult> {
+    const log = logger.child({
+      conversationId: envelope.conversationId,
+      inboxId: envelope.inboxId,
+    });
+
+    // 1. Persist inbound as a message row + load context
+    const inboundMessage = await this.persistInbound(envelope);
+    const conversation = await this.loadConversation(envelope.conversationId);
+    const settings = await this.loadSettings();
+    const recent = await this.loadRecent(envelope.conversationId);
+
+    const trace = await Trace.start({
+      conversationId: envelope.conversationId,
+      inboundMessageId: inboundMessage.id,
+      stageBefore: conversation.currentStage,
+    });
+
+    // Short-circuit: HITL active → silence
+    if (!conversation.agenteActivo) {
+      await trace.finalize({
+        stageAfter: conversation.currentStage,
+        intent: null,
+        outboundCount: 0,
+        status: 'silent',
+        silenceReason: 'HITL_ACTIVE',
+      });
+      return { traceId: trace.id, status: 'silent', outboundCount: 0 };
+    }
+
+    // Short-circuit: empty audio transcription → fallback
+    if (envelope.transcriptionStatus === 'empty' || envelope.transcriptionStatus === 'failed') {
+      const guard = await applyAlwaysRespondGuard({
+        trace,
+        conversationId: envelope.conversationId,
+        channel: envelope.channel,
+        outbound: [],
+        silenceReason: null,
+        fallbackReason: 'TRANSCRIPTION_EMPTY',
+        context: { transcriptionStatus: envelope.transcriptionStatus },
+      });
+      await this.deliverOutbound(envelope.conversationId, guard.outbound, trace.id);
+      await trace.finalize({
+        stageAfter: conversation.currentStage,
+        intent: null,
+        outboundCount: guard.outbound.length,
+        status: 'fallback',
+      });
+      return { traceId: trace.id, status: 'fallback', outboundCount: guard.outbound.length };
+    }
+
+    const userText = (envelope.text ?? '').trim();
+    if (!userText) {
+      // No content at all (and not audio) — should never happen but we guard.
+      const guard = await applyAlwaysRespondGuard({
+        trace,
+        conversationId: envelope.conversationId,
+        channel: envelope.channel,
+        outbound: [],
+        silenceReason: null,
+        fallbackReason: 'NO_OUTBOUND_NO_REASON',
+        context: { reason: 'empty inbound text' },
+      });
+      await this.deliverOutbound(envelope.conversationId, guard.outbound, trace.id);
+      await trace.finalize({
+        stageAfter: conversation.currentStage,
+        intent: null,
+        outboundCount: guard.outbound.length,
+        status: 'fallback',
+      });
+      return { traceId: trace.id, status: 'fallback', outboundCount: guard.outbound.length };
+    }
+
+    // 2. Route
+    const ruleRoute = applyDeterministicRules(userText);
+    let outbound: OutboundMessage[] = [];
+    let nextStage: Stage = conversation.currentStage;
+    let intent: Intent | null = null;
+    let fallbackReason: 'STAGE_HANDLER_THREW' | 'TOOL_LOOP_EXHAUSTED' | undefined;
+
+    try {
+      // For now: only deterministic rules are wired. LLM router classifier is
+      // implemented in router.ts but we'll plug it in once QA stage exists.
+      if (ruleRoute?.destination === 'hitl') {
+        nextStage = 'HITL';
+        intent = 'HITL_REQUEST';
+        outbound = [
+          {
+            channel: envelope.channel,
+            type: 'text',
+            text:
+              settings.handoffMessage ??
+              'Te paso con un asesor humano para que te atienda mejor.',
+          },
+        ];
+      } else if (ruleRoute?.destination === 'qa') {
+        // QA stage not yet implemented — fall through to stage handler for now,
+        // but mark in the trace context that we'd have routed to QA.
+        log.info({ topic: ruleRoute.reason }, 'rule routed to qa (not yet implemented)');
+        const decision = await this.runStage(conversation.currentStage, {
+          userText,
+          recentMessages: recent,
+          conversation,
+          settings,
+          trace,
+        });
+        intent = decision.intent;
+        nextStage = decision.nextStage;
+        outbound = decision.outbound.map(
+          (m: OutboundMessage): OutboundMessage => ({ ...m, channel: envelope.channel }),
+        );
+      } else {
+        const decision = await this.runStage(conversation.currentStage, {
+          userText,
+          recentMessages: recent,
+          conversation,
+          settings,
+          trace,
+        });
+        intent = decision.intent;
+        nextStage = decision.nextStage;
+        outbound = decision.outbound.map(
+          (m: OutboundMessage): OutboundMessage => ({ ...m, channel: envelope.channel }),
+        );
+      }
+    } catch (err) {
+      log.error({ err }, 'stage handler threw');
+      fallbackReason = 'STAGE_HANDLER_THREW';
+      await trace.recordTurn({
+        stage: conversation.currentStage,
+        model: 'n/a',
+        prompt: { userText },
+        response: null,
+        toolsCalled: [],
+        tokensIn: null,
+        tokensOut: null,
+        costUsd: null,
+        latencyMs: null,
+        status: 'error',
+        errorDetail: { message: err instanceof Error ? err.message : String(err) },
+      });
+    }
+
+    // 3. Always-respond guard
+    const guard = await applyAlwaysRespondGuard({
+      trace,
+      conversationId: envelope.conversationId,
+      channel: envelope.channel,
+      outbound,
+      silenceReason: null,
+      ...(fallbackReason ? { fallbackReason } : {}),
+      context: { intent, nextStage },
+    });
+
+    // 4. Deliver outbound
+    await this.deliverOutbound(envelope.conversationId, guard.outbound, trace.id);
+
+    // 5. Persist conversation update
+    await this.persistConversationUpdate(envelope.conversationId, nextStage);
+
+    await trace.finalize({
+      stageAfter: nextStage,
+      intent,
+      outboundCount: guard.outbound.length,
+      status: guard.status === 'silent' ? 'silent' : guard.status === 'fallback' ? 'fallback' : 'ok',
+    });
+
+    return {
+      traceId: trace.id,
+      status: guard.status,
+      outboundCount: guard.outbound.length,
+    };
+  }
+
+  private async runStage(stage: Stage, input: StageInput) {
+    const handler = getStageHandler(stage);
+    return handler.handle(input);
+  }
+
+  private async persistInbound(envelope: InboundEnvelope): Promise<{ id: string }> {
+    const r = await query<{ id: string }>(
+      `INSERT INTO messages
+         (conversation_id, external_message_id, direction, message_type, content,
+          media_url, media_mime_type, media_duration_sec, transcription_status, state_at_time)
+         SELECT $1, $2, 'inbound', $3, $4, $5, $6, $7, $8, current_stage
+           FROM conversations WHERE wa_id = $1
+         RETURNING id`,
+      [
+        envelope.conversationId,
+        envelope.externalMessageId ?? null,
+        envelope.mediaUrl ? 'AUDIO' : 'TEXT',
+        envelope.text ?? null,
+        envelope.mediaUrl ?? null,
+        envelope.mediaMimeType ?? null,
+        envelope.mediaDurationSec ?? null,
+        envelope.transcriptionStatus,
+      ],
+    );
+    const id = r.rows[0]?.id;
+    if (!id) throw new Error('failed to persist inbound message');
+    return { id };
+  }
+
+  private async loadConversation(conversationId: string): Promise<ConversationContext> {
+    const r = await query<{
+      wa_id: string;
+      chatwoot_conversation_id: number | null;
+      client_name: string | null;
+      current_stage: Stage;
+      search_criteria: ConversationContext['searchCriteria'];
+      shown_fincas: string[];
+      selected_finca: string | null;
+      owner_response: ConversationContext['ownerResponse'] | null;
+      pricing: ConversationContext['pricing'] | null;
+      reservation: ConversationContext['reservation'] | null;
+      agente_activo: boolean;
+      hitl_reason: string | null;
+      extras: Record<string, unknown>;
+    }>(
+      `SELECT * FROM conversations WHERE wa_id = $1`,
+      [conversationId],
+    );
+    const row = r.rows[0];
+    if (!row) throw new Error(`conversation not found: ${conversationId}`);
+    return {
+      waId: row.wa_id,
+      chatwootConversationId: row.chatwoot_conversation_id ?? undefined,
+      clientName: row.client_name ?? undefined,
+      currentStage: row.current_stage,
+      searchCriteria: row.search_criteria ?? {},
+      shownFincas: row.shown_fincas ?? [],
+      selectedFinca: row.selected_finca ?? undefined,
+      ownerResponse: row.owner_response ?? undefined,
+      pricing: row.pricing ?? undefined,
+      reservation: row.reservation ?? undefined,
+      agenteActivo: row.agente_activo,
+      hitlReason: row.hitl_reason ?? undefined,
+      extras: row.extras ?? {},
+    };
+  }
+
+  private async loadSettings(): Promise<AgentSettingsView> {
+    const r = await query<{
+      tone_preset: string;
+      tone_guidelines_extra: string | null;
+      initial_message_template: string | null;
+      handoff_message: string | null;
+      company_knowledge: Record<string, unknown>;
+      company_documents: Array<{ name: string; url?: string; topics?: string[] }>;
+      payment_methods: Record<string, unknown>;
+    }>(`SELECT * FROM agent_settings WHERE id = 1`);
+    const row = r.rows[0];
+    if (!row) throw new Error('agent_settings row not found');
+    return {
+      tonePreset: row.tone_preset,
+      toneGuidelinesExtra: row.tone_guidelines_extra ?? undefined,
+      initialMessageTemplate: row.initial_message_template ?? undefined,
+      handoffMessage: row.handoff_message ?? undefined,
+      companyKnowledge: row.company_knowledge ?? {},
+      companyDocuments: row.company_documents ?? [],
+      paymentMethods: row.payment_methods ?? {},
+    };
+  }
+
+  private async loadRecent(
+    conversationId: string,
+  ): Promise<Array<{ role: 'user' | 'assistant'; content: string; createdAt: string }>> {
+    const r = await query<{ direction: string; content: string | null; created_at: string }>(
+      `SELECT direction, content, created_at
+         FROM messages
+        WHERE conversation_id = $1 AND content IS NOT NULL
+        ORDER BY created_at DESC
+        LIMIT 12`,
+      [conversationId],
+    );
+    return r.rows.map((row) => ({
+      role: row.direction === 'inbound' ? 'user' : 'assistant',
+      content: row.content ?? '',
+      createdAt: row.created_at,
+    }));
+  }
+
+  private async deliverOutbound(
+    conversationId: string,
+    outbound: OutboundMessage[],
+    traceId: string,
+  ): Promise<void> {
+    for (const msg of outbound) {
+      const adapter = getChannel(msg.channel);
+      try {
+        const sendResult = await adapter.send(conversationId, msg);
+        await withTx(async (client) => {
+          await client.query(
+            `INSERT INTO messages
+               (conversation_id, external_message_id, direction, message_type, content)
+               VALUES ($1, $2, 'outbound', 'TEXT', $3)`,
+            [conversationId, sendResult.externalMessageId ?? null, msg.text ?? ''],
+          );
+          await client.query(
+            `INSERT INTO message_outbox
+               (trace_id, conversation_id, channel, payload, status, sent_at, external_message_id)
+               VALUES ($1, $2, $3, $4::jsonb, 'sent', now(), $5)`,
+            [
+              traceId,
+              conversationId,
+              msg.channel,
+              JSON.stringify(msg),
+              sendResult.externalMessageId ?? null,
+            ],
+          );
+        });
+      } catch (err) {
+        logger.error({ err, conversationId }, 'channel send failed');
+        await query(
+          `INSERT INTO message_outbox
+             (trace_id, conversation_id, channel, payload, status, last_error)
+             VALUES ($1, $2, $3, $4::jsonb, 'failed', $5)`,
+          [
+            traceId,
+            conversationId,
+            msg.channel,
+            JSON.stringify(msg),
+            err instanceof Error ? err.message : String(err),
+          ],
+        );
+        throw err;
+      }
+    }
+  }
+
+  private async persistConversationUpdate(
+    conversationId: string,
+    nextStage: Stage,
+  ): Promise<void> {
+    await query(
+      `UPDATE conversations
+          SET current_stage = $2,
+              agente_activo = CASE WHEN $2 = 'HITL' THEN false ELSE agente_activo END
+        WHERE wa_id = $1`,
+      [conversationId, nextStage],
+    );
+  }
+}
+
+export const orchestrator = new Orchestrator();

@@ -1,0 +1,94 @@
+/**
+ * QUALIFYING stage handler. Goal: collect minimum data (dates, people count,
+ * zone) before moving to OFFERING.
+ *
+ * Output is the structured StageDecision JSON. We rely on the LLM provider's
+ * schema validation; if the LLM returns garbage, the provider retries once and
+ * then throws — the orchestrator catches and triggers fallback.
+ */
+import { stageDecisionSchema } from '@depf/shared';
+import type { StageDecision } from '@depf/shared';
+import type { StageHandler, StageInput } from './types.js';
+import { getLLM } from '../llm/index.js';
+
+const QUALIFYING_SYSTEM = `Eres el asistente conversacional de "De Paseo en Fincas", una empresa colombiana que renta fincas vacacionales. Estás en el estado QUALIFYING.
+
+OBJETIVO de este estado: recopilar los datos mínimos del cliente — fecha de inicio, fecha de fin, número de personas, y zona/destino. Si el cliente da algunos datos pero faltan otros, pídelos de forma natural y breve.
+
+REGLAS:
+- Tono: {TONE_GUIDELINES}
+- Sé breve (1–3 frases). Una pregunta máximo por mensaje.
+- NO inventes información que no tengas.
+- Si el cliente saluda solamente → intent="GREETING", responde con saludo y la primera pregunta.
+- Si el cliente da datos parciales o completos → intent="QUALIFYING".
+- Si todos los datos están completos (fechas + personas + zona) → next_stage="OFFERING".
+- Si el cliente pide hablar con humano → intent="HITL_REQUEST", next_stage="HITL".
+- Si el cliente quiere cancelar → intent="CANCEL", next_stage="HITL".
+- Si dice algo fuera de tema → intent="OFF_TOPIC", redirige amablemente.
+
+DEBES devolver un JSON con esta forma exacta:
+{
+  "intent": "GREETING|QUALIFYING|QUESTION|HITL_REQUEST|OFF_TOPIC|CANCEL",
+  "extracted_data": { "fechaInicio"?: "YYYY-MM-DD", "fechaFin"?: "YYYY-MM-DD", "personas"?: number, "zona"?: string },
+  "next_stage": "QUALIFYING|OFFERING|HITL",
+  "outbound_text": "<lo que respondes al cliente, en español colombiano>",
+  "tool_calls": [],
+  "reasoning": "<por qué decidiste así, 1 frase>",
+  "done": true
+}`;
+
+class QualifyingStage implements StageHandler {
+  readonly stage = 'QUALIFYING' as const;
+
+  async handle(input: StageInput): Promise<StageDecision> {
+    const llm = getLLM();
+    const tone = `${input.settings.tonePreset}. ${input.settings.toneGuidelinesExtra ?? ''}`;
+    const system = QUALIFYING_SYSTEM.replace('{TONE_GUIDELINES}', tone);
+
+    const history = input.recentMessages
+      .slice(0, 10)
+      .reverse()
+      .map((m) => ({
+        role: m.role === 'assistant' ? ('assistant' as const) : ('user' as const),
+        content: m.content,
+      }));
+
+    const result = await llm.generate({
+      name: 'qualifying-stage',
+      messages: [
+        { role: 'system', content: system },
+        ...history,
+        { role: 'user', content: input.userText },
+      ],
+      schema: stageDecisionSchema,
+      temperature: 0.3,
+    });
+
+    await input.trace.recordTurn({
+      stage: 'QUALIFYING',
+      model: result.model,
+      prompt: { system, history, userText: input.userText },
+      response: result.data,
+      toolsCalled: [],
+      tokensIn: result.usage.tokensIn,
+      tokensOut: result.usage.tokensOut,
+      costUsd: result.usage.costUsd,
+      latencyMs: result.latencyMs,
+      status: 'ok',
+    });
+
+    const data = result.data;
+    return {
+      intent: data.intent,
+      extractedData: data.extracted_data,
+      nextStage: data.next_stage,
+      outbound: data.outbound_text
+        ? [{ channel: 'simulator', type: 'text', text: data.outbound_text }]
+        : [],
+      toolCalls: [],
+      reasoning: data.reasoning,
+    };
+  }
+}
+
+export const qualifyingStage = new QualifyingStage();
