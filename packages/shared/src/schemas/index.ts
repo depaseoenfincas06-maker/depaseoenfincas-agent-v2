@@ -67,26 +67,52 @@ export const reservationDataSchema = z
   .strict();
 
 /**
+ * Tolerant tool_call entry. Gemini frequently emits {tool_name, parameters}
+ * instead of {name, input}. We accept either and normalize via preprocess.
+ */
+const toolCallSchema = z
+  .object({
+    name: z.string().optional(),
+    tool_name: z.string().optional(),
+    input: z.record(z.unknown()).optional(),
+    parameters: z.record(z.unknown()).optional(),
+    arguments: z.record(z.unknown()).optional(),
+  })
+  .transform((v) => ({
+    name: v.name ?? v.tool_name ?? '',
+    input: v.input ?? v.parameters ?? v.arguments ?? {},
+  }))
+  .pipe(z.object({ name: z.string().min(1), input: z.record(z.unknown()) }));
+
+/**
  * The structured JSON we force the LLM to produce on every stage call.
  * Validating this prevents "Max iterations" loops because we never
  * give the LLM permission to keep going beyond what it returns here.
+ *
+ * Tolerant where it can be: nulls accepted in optional string fields,
+ * tool_calls accept both {name,input} and {tool_name,parameters} shapes.
  */
-export const stageDecisionSchema = z.object({
-  intent: intentSchema,
-  extracted_data: searchCriteriaSchema.merge(reservationDataSchema).partial(),
-  next_stage: stageSchema,
-  outbound_text: z.string().optional(),
-  tool_calls: z
-    .array(
-      z.object({
-        name: z.string(),
-        input: z.record(z.unknown()),
-      }),
-    )
-    .default([]),
-  reasoning: z.string(),
-  done: z.boolean().default(true),
-});
+export const stageDecisionSchema = z.preprocess(
+  (raw) => {
+    if (raw == null || typeof raw !== 'object') return raw;
+    const v = raw as Record<string, unknown>;
+    // Coerce nulls in optional string fields → undefined so .optional() passes.
+    if (v.outbound_text === null) v.outbound_text = undefined;
+    if (v.reasoning === null) v.reasoning = '';
+    if (v.tool_calls === null) v.tool_calls = [];
+    if (v.extracted_data === null) v.extracted_data = {};
+    return v;
+  },
+  z.object({
+    intent: intentSchema,
+    extracted_data: searchCriteriaSchema.merge(reservationDataSchema).partial(),
+    next_stage: stageSchema,
+    outbound_text: z.string().optional(),
+    tool_calls: z.array(toolCallSchema).default([]),
+    reasoning: z.string().default(''),
+    done: z.boolean().default(true),
+  }),
+);
 
 export type StageDecisionRaw = z.infer<typeof stageDecisionSchema>;
 

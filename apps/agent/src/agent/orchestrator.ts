@@ -277,6 +277,18 @@ export class Orchestrator {
   }
 
   private async persistInbound(envelope: InboundEnvelope): Promise<{ id: string }> {
+    // Pick a message_type that satisfies the messages_text_or_media constraint.
+    // - real text → TEXT
+    // - audio with successful transcription → AUDIO (text in content)
+    // - audio with empty/failed transcription → AUDIO_UNTRANSCRIBED (no content)
+    let messageType: string;
+    if (envelope.transcriptionStatus === 'empty' || envelope.transcriptionStatus === 'failed') {
+      messageType = 'AUDIO_UNTRANSCRIBED';
+    } else if (envelope.mediaUrl) {
+      messageType = 'AUDIO';
+    } else {
+      messageType = 'TEXT';
+    }
     const r = await query<{ id: string }>(
       `INSERT INTO messages
          (conversation_id, external_message_id, direction, message_type, content,
@@ -287,7 +299,7 @@ export class Orchestrator {
       [
         envelope.conversationId,
         envelope.externalMessageId ?? null,
-        envelope.mediaUrl ? 'AUDIO' : 'TEXT',
+        messageType,
         envelope.text ?? null,
         envelope.mediaUrl ?? null,
         envelope.mediaMimeType ?? null,
