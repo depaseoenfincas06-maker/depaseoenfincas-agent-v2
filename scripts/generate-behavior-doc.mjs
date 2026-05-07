@@ -147,6 +147,7 @@ function genericTable(headers, rows) {
 function h1(text) {
   return new Paragraph({
     heading: HeadingLevel.HEADING_1,
+    pageBreakBefore: true,
     spacing: { before: 360, after: 200 },
     children: [
       new TextRun({ text, bold: true, font: 'Arial', size: 32, color: '1B4F72' }),
@@ -231,11 +232,10 @@ function spacer() {
   return new Paragraph({ spacing: { after: 80 }, children: [] });
 }
 
+// Empty array — kept so existing call sites compile. Page break is achieved
+// via Heading 1 style having pageBreakBefore set in styles config.
 function pageBreak() {
-  return new Paragraph({
-    children: [new TextRun({ text: '', break: 1 })],
-    pageBreakBefore: true,
-  });
+  return [];
 }
 
 // ---- Document content -----------------------------------------------------
@@ -1032,7 +1032,7 @@ const doc = new Document({
         next: 'Normal',
         quickFormat: true,
         run: { size: 32, bold: true, font: 'Arial', color: '1B4F72' },
-        paragraph: { spacing: { before: 360, after: 200 }, outlineLevel: 0 },
+        paragraph: { spacing: { before: 360, after: 200 }, outlineLevel: 0, pageBreakBefore: true },
       },
       {
         id: 'Heading2',
