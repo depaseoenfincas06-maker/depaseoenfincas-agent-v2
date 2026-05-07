@@ -44,6 +44,8 @@ export interface LLMError extends Error {
   kind: 'malformed' | 'timeout' | 'transport' | 'validation' | 'unknown';
   rawText?: string;
   attempts?: number;
+  /** Compact summary of zod validation issues, used for retry guidance. */
+  issues?: string;
 }
 
 export interface LLMProvider {

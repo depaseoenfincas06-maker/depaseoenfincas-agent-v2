@@ -1,6 +1,7 @@
 import Fastify from 'fastify';
 import sensible from '@fastify/sensible';
 import cors from '@fastify/cors';
+import multipart from '@fastify/multipart';
 import { config } from '../config.js';
 import { logger } from '../observability/logger.js';
 import { pool } from '../persistence/db.js';
@@ -13,6 +14,7 @@ async function buildServer() {
 
   await app.register(sensible);
   await app.register(cors, { origin: true });
+  await app.register(multipart, { limits: { fileSize: 50 * 1024 * 1024 } }); // 50MB max for audio uploads
 
   app.get('/health', async () => {
     const dbOk = await pool

@@ -13,6 +13,7 @@ const NAV = [
   { href: '/kanban', label: 'Kanban' },
   { href: '/traces', label: 'Traces' },
   { href: '/fallbacks', label: 'Fallbacks' },
+  { href: '/transcribe-test', label: 'Transcribe' },
   { href: '/settings', label: 'Settings' },
 ];
 

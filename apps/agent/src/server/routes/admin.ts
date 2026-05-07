@@ -4,9 +4,12 @@
  * VPN in deployment.
  */
 import type { FastifyInstance } from 'fastify';
+import { Buffer } from 'node:buffer';
 import { z } from 'zod';
 import { pool } from '../../persistence/db.js';
-import { refreshInventory } from '../../inventory/loader.js';
+import { loadFincas, refreshInventory } from '../../inventory/loader.js';
+import { transcribe, buildDomainPrompt } from '../../media/transcribe.js';
+import { downloadMedia } from '../../media/download.js';
 
 const settingsPatchSchema = z
   .object({
@@ -199,6 +202,105 @@ export async function adminRoutes(app: FastifyInstance) {
   app.post('/inventory/refresh', async () => {
     const count = await refreshInventory();
     return { ok: true, count };
+  });
+
+  // ---- transcription smoke test ----
+  // Two ways to invoke:
+  //   1. multipart/form-data with field "file" — uploads an audio buffer
+  //   2. application/json { "url": "..." } — downloads from a URL
+  // Returns the full TranscriptionResult with all attempts.
+  app.post('/admin/transcribe-test', async (req, reply) => {
+    const ct = req.headers['content-type'] ?? '';
+    let buffer: Buffer | undefined;
+    let mimeType = 'audio/ogg';
+    let filename = `upload-${Date.now()}.audio`;
+    let durationSec: number | null = null;
+
+    if (ct.includes('multipart/form-data')) {
+      const file = await (req as unknown as {
+        file: () => Promise<{
+          file: NodeJS.ReadableStream;
+          mimetype: string;
+          filename: string;
+        } | undefined>;
+      }).file();
+      if (!file) return reply.badRequest('missing "file" field in multipart form');
+      mimeType = file.mimetype;
+      filename = file.filename;
+      const chunks: Buffer[] = [];
+      for await (const chunk of file.file) {
+        if (Buffer.isBuffer(chunk)) chunks.push(chunk);
+        else if (typeof chunk === 'string') chunks.push(Buffer.from(chunk));
+        else chunks.push(Buffer.from(chunk as ArrayBuffer));
+      }
+      buffer = Buffer.concat(chunks);
+    } else if (ct.includes('application/json')) {
+      const body = z
+        .object({
+          url: z.string().url(),
+          mimeType: z.string().optional(),
+          durationSec: z.number().optional(),
+        })
+        .safeParse(req.body);
+      if (!body.success) return reply.badRequest('invalid JSON body — need { url }');
+      const downloaded = await downloadMedia(body.data.url, body.data.mimeType);
+      buffer = downloaded.buffer;
+      mimeType = downloaded.mimeType;
+      filename = downloaded.filename;
+      durationSec = body.data.durationSec ?? null;
+    } else {
+      return reply.badRequest('content-type must be multipart/form-data or application/json');
+    }
+
+    if (!buffer || buffer.length === 0) {
+      return reply.badRequest('empty audio payload');
+    }
+
+    // If mime is generic, infer from filename extension. Many uploads
+    // (browsers, curl from CLI, Mac AIFF) come with octet-stream.
+    if (mimeType === 'application/octet-stream' || !mimeType.startsWith('audio')) {
+      const ext = filename.toLowerCase().split('.').pop() ?? '';
+      const extMap: Record<string, string> = {
+        ogg: 'audio/ogg',
+        oga: 'audio/ogg',
+        opus: 'audio/ogg',
+        mp3: 'audio/mpeg',
+        m4a: 'audio/m4a',
+        aac: 'audio/aac',
+        wav: 'audio/wav',
+        webm: 'audio/webm',
+        flac: 'audio/flac',
+        aiff: 'audio/aiff',
+        aif: 'audio/aiff',
+        mp4: 'audio/mp4',
+      };
+      if (extMap[ext]) mimeType = extMap[ext];
+    }
+
+    // Build domain prompt from inventory. Filter to short, code-like strings
+    // because the sheet parser sometimes returns descriptions in the id slot.
+    const fincas = await loadFincas().catch(() => []);
+    const codeLike = (s: string): boolean =>
+      typeof s === 'string' && s.length > 0 && s.length <= 20 && !/[\s,;]/.test(s);
+    const domainPrompt = buildDomainPrompt({
+      fincaCodes: fincas.map((f) => f.fincaId).filter(codeLike).slice(0, 30),
+    });
+
+    const startedAt = Date.now();
+    const result = await transcribe(
+      { buffer, mimeType, filename, durationSec },
+      { domainPrompt, language: 'es' },
+    );
+    return {
+      ok: result.ok,
+      status: result.status,
+      text: result.text,
+      reason: result.reason,
+      attempts: result.attempts,
+      input: { mimeType, filename, bytes: buffer.length, durationSec },
+      domainPrompt,
+      latencyMs: Date.now() - startedAt,
+    };
   });
 
   // ---- health ----

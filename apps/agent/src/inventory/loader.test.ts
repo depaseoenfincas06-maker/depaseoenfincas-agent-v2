@@ -48,13 +48,8 @@ const FIXTURE: Finca[] = [
 ];
 
 beforeAll(async () => {
-  // Inject fixture into the module-level cache so loadFincas() returns it.
-  // We use a side-effecting import that prepopulates the cache.
   const mod = await import('./loader.js');
-  // @ts-expect-error - access internal cache for testing
-  mod.__test_setCache?.(FIXTURE);
-  // Fallback if test hook isn't there — monkey-patch via reflection.
-  // (Hook is added below.)
+  mod.__test_setCache(FIXTURE);
 });
 
 describe('matchFincas', () => {

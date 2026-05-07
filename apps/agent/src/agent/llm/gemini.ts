@@ -96,12 +96,26 @@ class GeminiProvider implements LLMProvider {
         );
         rawText = result.response.text();
         const cleaned = extractJson(rawText);
-        const parsed = JSON.parse(cleaned);
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(cleaned);
+        } catch (parseErr) {
+          // Re-throw as SyntaxError so the catch below triggers a corrective retry.
+          throw parseErr;
+        }
         const validated = req.schema.safeParse(parsed);
         if (!validated.success) {
-          throw createLLMError('validation', 'response did not match schema', {
+          // Build a compact human-readable summary of the validation issues,
+          // suitable to feed back to the LLM as corrective guidance.
+          const issues = validated.error.issues
+            .map((i) => `${i.path.join('.') || '(root)'}: ${i.message}`)
+            .slice(0, 6)
+            .join('; ');
+          const validationErr = createLLMError('validation', 'response did not match schema', {
             rawText,
+            issues,
           });
+          throw validationErr;
         }
         const usage = result.response.usageMetadata;
         const tokensIn = usage?.promptTokenCount ?? 0;
@@ -119,13 +133,11 @@ class GeminiProvider implements LLMProvider {
         };
       } catch (err) {
         lastError = err;
+        const kind = (err as { kind?: string }).kind;
         if (err instanceof SyntaxError) {
           // Parse failure — try once more with a corrective message.
           conversation.push(
-            {
-              role: 'model',
-              parts: [{ text: rawText }],
-            },
+            { role: 'model', parts: [{ text: rawText }] },
             {
               role: 'user',
               parts: [
@@ -137,7 +149,24 @@ class GeminiProvider implements LLMProvider {
           );
           continue;
         }
-        // Validation, timeout, transport — break early
+        if (kind === 'validation' && attempt <= MAX_PARSE_RETRIES) {
+          // Validation failure — retry with the specific issues quoted, so the
+          // LLM can fix THAT exact problem instead of guessing.
+          const issues = (err as { issues?: string }).issues ?? '';
+          conversation.push(
+            { role: 'model', parts: [{ text: rawText }] },
+            {
+              role: 'user',
+              parts: [
+                {
+                  text: `Tu respuesta JSON no cumple el schema. Errores: ${issues}. Responde SOLO con un JSON válido corrigiendo esos campos. Recuerda: "intent" debe ser uno de los enum permitidos (GREETING, QUALIFYING, SHOW_OPTIONS, CLIENT_CHOSE, ADJUST_CRITERIA, NO_MATCH, WAITING_OWNER, CHANGE_FINCA, REQUEST_CONFIRMATION_DATA, DOCUMENT_READY, QUESTION, QA_ANSWERED, OFF_TOPIC, HITL_REQUEST, CANCEL); "tool_calls" es un array (use [] vacío si no hay); "extracted_data" es un objeto (use {} vacío si no hay).`,
+                },
+              ],
+            },
+          );
+          continue;
+        }
+        // Timeout, transport, or out of retries — break early
         break;
       }
     }

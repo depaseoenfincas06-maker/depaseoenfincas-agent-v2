@@ -98,27 +98,97 @@ const toolCallSchema = z
   .pipe(z.object({ name: z.string().min(1), input: z.record(z.unknown()) }));
 
 /**
+ * Map of common Gemini intent variants → canonical intents in our enum.
+ * Whenever the LLM emits an intent that's "close enough", we coerce it
+ * instead of failing validation. This is essential for stages where the
+ * LLM doesn't have one obvious intent name (CONFIRMING data collection,
+ * QA send_document responses, etc.). Add liberally — defense in depth.
+ */
+const INTENT_ALIASES: Record<string, string> = {
+  CONTINUE: 'QUESTION',
+  CONTINUING: 'QUESTION',
+  COLLECTING: 'REQUEST_CONFIRMATION_DATA',
+  COLLECT_DATA: 'REQUEST_CONFIRMATION_DATA',
+  PROVIDE_INFO: 'REQUEST_CONFIRMATION_DATA',
+  EXTRACT_DATA: 'REQUEST_CONFIRMATION_DATA',
+  GATHERING_DATA: 'REQUEST_CONFIRMATION_DATA',
+  PROVIDE_DOCUMENT: 'QA_ANSWERED',
+  SEND_DOCUMENT: 'QA_ANSWERED',
+  INFORM: 'QA_ANSWERED',
+  ANSWERING: 'QA_ANSWERED',
+  ASK_HUMAN: 'HITL_REQUEST',
+  ESCALATE: 'HITL_REQUEST',
+  HANDOFF: 'HITL_REQUEST',
+  PRESENT_OPTIONS: 'SHOW_OPTIONS',
+  PRESENT_FINCAS: 'SHOW_OPTIONS',
+  CHOSE: 'CLIENT_CHOSE',
+  CLIENT_SELECTED: 'CLIENT_CHOSE',
+  ADJUST: 'ADJUST_CRITERIA',
+  REFINE_SEARCH: 'ADJUST_CRITERIA',
+  GREET: 'GREETING',
+  GENERATE_PDF: 'DOCUMENT_READY',
+  PDF_READY: 'DOCUMENT_READY',
+};
+
+/**
  * The structured JSON we force the LLM to produce on every stage call.
  * Validating this prevents "Max iterations" loops because we never
  * give the LLM permission to keep going beyond what it returns here.
  *
- * Tolerant where it can be: nulls accepted in optional string fields,
- * tool_calls accept both {name,input} and {tool_name,parameters} shapes.
+ * Tolerant where it can be:
+ *  - nulls accepted in optional string fields → undefined
+ *  - tool_calls null/missing → []
+ *  - tool_call (singular) → tool_calls (array of 1)
+ *  - {name, input} or {tool_name, parameters} on each tool call
+ *  - extracted_data null/missing → {}
+ *  - intent variants mapped to canonical via INTENT_ALIASES
+ *  - next_stage null/missing → undefined (stage handler defaults to current)
  */
 export const stageDecisionSchema = z.preprocess(
   (raw) => {
     if (raw == null || typeof raw !== 'object') return raw;
     const v = raw as Record<string, unknown>;
-    // Coerce nulls in optional string fields → undefined so .optional() passes.
+
+    // String fields with null tolerance
     if (v.outbound_text === null) v.outbound_text = undefined;
     if (v.reasoning === null) v.reasoning = '';
-    if (v.tool_calls === null) v.tool_calls = [];
-    if (v.extracted_data === null) v.extracted_data = {};
+
+    // tool_calls: null/missing → []
+    if (v.tool_calls == null) v.tool_calls = [];
+
+    // tool_call (singular) — Gemini sometimes emits this when there's exactly 1
+    if (v.tool_call != null) {
+      const single = v.tool_call;
+      if (Array.isArray(v.tool_calls) && v.tool_calls.length === 0) {
+        v.tool_calls = Array.isArray(single) ? single : [single];
+      }
+      delete v.tool_call;
+    }
+
+    // extracted_data: null/missing → {}
+    if (v.extracted_data == null) v.extracted_data = {};
+
+    // intent aliases — case-insensitive lookup
+    if (typeof v.intent === 'string') {
+      const upper = v.intent.toUpperCase().trim();
+      if (INTENT_ALIASES[upper]) {
+        v.intent = INTENT_ALIASES[upper];
+      } else {
+        // Normalize casing for direct enum match
+        v.intent = upper;
+      }
+    }
+
+    // next_stage: null → undefined → schema default
+    if (v.next_stage == null) v.next_stage = undefined;
+
     return v;
   },
   z.object({
     intent: intentSchema,
     extracted_data: searchCriteriaSchema.merge(reservationDataSchema).partial(),
+    // next_stage stays required at the type level, but if undefined the LLM
+    // didn't decide — caller should fall back to current stage.
     next_stage: stageSchema,
     outbound_text: z.string().optional(),
     tool_calls: z.array(toolCallSchema).default([]),
