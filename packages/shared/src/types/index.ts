@@ -84,7 +84,12 @@ export interface SearchCriteria {
   fechaInicio?: string;
   fechaFin?: string;
   personas?: number;
-  zona?: string;
+  /**
+   * Internally always stored as string[] after schema preprocess. Inventory
+   * matching is OR across the array (any zone match passes).
+   */
+  zona?: string[];
+  ciudad?: string[];
   presupuestoMax?: number;
   tipoEvento?: string;
   amenidades?: string[];

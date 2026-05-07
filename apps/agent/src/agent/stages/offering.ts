@@ -41,6 +41,10 @@ CONTEXTO:
 - search_criteria: {SEARCH_CRITERIA}
 - shown_fincas (NO repetir): {SHOWN_FINCAS}
 
+NOTA sobre zona/ciudad:
+- search_criteria.zona puede ser un ARRAY (ej. ["Carmen","Girardot"]). Cuando llames list_matching_fincas, pasa el mismo array como zona — el tool busca con OR (cualquiera de las zonas matchea).
+- Si en algún mensaje el cliente menciona destinos adicionales ("¿qué tienes también en Melgar?"), agrégalo al array en extracted_data.zona y vuelve a llamar list_matching_fincas con el array actualizado + excludeIds = shown_fincas.
+
 ${INVENTORY_TOOL_DESCRIPTIONS}
 
 DEBES devolver UN JSON con la forma de stageDecisionSchema. Si necesitas tools, ponlos en tool_calls con done=false. Si tu respuesta es final, done=true y outbound_text con tu mensaje al cliente.`;

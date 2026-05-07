@@ -21,8 +21,13 @@ export interface Finca {
 
 export interface FincaQuery {
   personas?: number;
-  zona?: string;
-  ciudad?: string;
+  /**
+   * Either a single zone or an array (OR logic). A finca matches if its zona
+   * matches ANY of the entries.
+   */
+  zona?: string | string[];
+  /** Same as zona — accepts string or array, matched with OR. */
+  ciudad?: string | string[];
   presupuestoMax?: number;
   amenidadesRequeridas?: string[];
   mascotas?: boolean;

@@ -8,10 +8,13 @@ import { z } from 'zod';
 import { matchFincas, getFincaById } from '../../inventory/loader.js';
 import type { FincaMatch } from '../../inventory/types.js';
 
+// Accept either a single string or an array (OR matching). Normalize inside.
+const zonaInput = z.union([z.string(), z.array(z.string())]).optional();
+
 export const listMatchingFincasInputSchema = z.object({
   personas: z.number().optional(),
-  zona: z.string().optional(),
-  ciudad: z.string().optional(),
+  zona: zonaInput,
+  ciudad: zonaInput,
   presupuestoMax: z.number().optional(),
   amenidadesRequeridas: z.array(z.string()).optional(),
   mascotas: z.boolean().optional(),
@@ -92,10 +95,18 @@ export const INVENTORY_TOOL_DESCRIPTIONS = `
 Tools disponibles en este stage:
 
 1. list_matching_fincas — busca fincas que matcheen criterios.
-   input: { personas?: number, zona?: string, ciudad?: string, presupuestoMax?: number,
-            amenidadesRequeridas?: string[], mascotas?: boolean, excludeIds?: string[], limit?: number }
+   input: {
+     personas?: number,
+     zona?: string | string[],     // si el cliente menciona varias ("Carmen O Girardot"), pasa array ["Carmen","Girardot"]
+     ciudad?: string | string[],
+     presupuestoMax?: number,
+     amenidadesRequeridas?: string[],
+     mascotas?: boolean,
+     excludeIds?: string[],         // SIEMPRE incluye las fincas ya mostradas (shown_fincas)
+     limit?: number
+   }
    output: { matches: PublicFincaView[], totalReturned: number }
-   Usa excludeIds para no repetir fincas ya mostradas.
+   El matching de zona/ciudad es OR: una finca pasa si su zona matchea CUALQUIERA de las del array.
 
 2. get_finca_details — info detallada de una finca específica.
    input: { fincaId: string }

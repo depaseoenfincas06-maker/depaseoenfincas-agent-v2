@@ -42,12 +42,25 @@ export const messageTypeSchema = z.enum([
   'SYSTEM',
 ]);
 
+/**
+ * `zona` and `ciudad` accept EITHER a single string ("Carmen") OR an array
+ * (["Carmen", "Girardot"]) when the client mentions multiple options. The
+ * preprocess normalizes both shapes to a string array — internally we always
+ * work with arrays. Inventory matching is OR across the array.
+ */
+const zonaListSchema = z
+  .union([z.string(), z.array(z.string())])
+  .transform((v) => (Array.isArray(v) ? v : [v]))
+  .pipe(z.array(z.string().min(1)).min(1))
+  .optional();
+
 export const searchCriteriaSchema = z
   .object({
     fechaInicio: z.string().optional(),
     fechaFin: z.string().optional(),
     personas: z.number().int().positive().optional(),
-    zona: z.string().optional(),
+    zona: zonaListSchema,
+    ciudad: zonaListSchema,
     presupuestoMax: z.number().nonnegative().optional(),
     tipoEvento: z.string().optional(),
     amenidades: z.array(z.string()).optional(),

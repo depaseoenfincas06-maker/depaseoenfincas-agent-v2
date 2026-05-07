@@ -168,6 +168,11 @@ export function toPublicView(finca: Finca): PublicFincaView {
   };
 }
 
+function asArray(v: string | string[] | undefined): string[] {
+  if (v == null) return [];
+  return Array.isArray(v) ? v : [v];
+}
+
 function score(finca: Finca, q: FincaQuery): { score: number; reasons: string[] } | null {
   const reasons: string[] = [];
   let s = 100;
@@ -180,13 +185,26 @@ function score(finca: Finca, q: FincaQuery): { score: number; reasons: string[] 
     reasons.push(`capacidad mínima ${finca.capacidadMin} > grupo ${q.personas}`);
   }
   if (q.mascotas && !finca.mascotas) return null;
-  if (q.zona && finca.zona && !zonaMatches(finca.zona, q.zona)) {
-    s -= 30;
-    reasons.push(`zona pedida "${q.zona}" vs zona finca "${finca.zona}"`);
+  // Zona / ciudad: OR matching. If the client said "Carmen O Girardot",
+  // match if the finca's zona matches ANY of those. The penalty applies
+  // only when NONE of the requested zones matched.
+  const zonas = asArray(q.zona);
+  if (zonas.length > 0 && finca.zona) {
+    const anyMatch = zonas.some((z) => zonaMatches(finca.zona, z));
+    if (!anyMatch) {
+      s -= 30;
+      reasons.push(`zona pedida "${zonas.join(' o ')}" vs zona finca "${finca.zona}"`);
+    } else if (zonas.length > 1) {
+      reasons.push(`matchea una de ${zonas.length} zonas pedidas`);
+    }
   }
-  if (q.ciudad && finca.ciudad && !zonaMatches(finca.ciudad, q.ciudad)) {
-    s -= 15;
-    reasons.push(`ciudad pedida "${q.ciudad}" vs ciudad finca "${finca.ciudad}"`);
+  const ciudades = asArray(q.ciudad);
+  if (ciudades.length > 0 && finca.ciudad) {
+    const anyMatch = ciudades.some((c) => zonaMatches(finca.ciudad ?? '', c));
+    if (!anyMatch) {
+      s -= 15;
+      reasons.push(`ciudad pedida "${ciudades.join(' o ')}" vs ciudad finca "${finca.ciudad}"`);
+    }
   }
   if (q.presupuestoMax && finca.precioPorNoche && finca.precioPorNoche > q.presupuestoMax) {
     s -= 25;
@@ -238,4 +256,13 @@ export async function getFincaById(fincaId: string): Promise<Finca | null> {
   const fincas = await loadFincas();
   const lower = fincaId.toLowerCase();
   return fincas.find((f) => f.fincaId.toLowerCase() === lower) ?? null;
+}
+
+/**
+ * Test-only hook: pre-populates the in-memory cache so unit tests can run
+ * matchFincas() against deterministic fixtures without hitting the network.
+ * NOT exported via index — only accessible by direct import for tests.
+ */
+export function __test_setCache(fincas: Finca[]): void {
+  cache = { fincas, loadedAt: Date.now() };
 }
