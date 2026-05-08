@@ -164,8 +164,16 @@ export class Orchestrator {
       return this.handleReset(envelope, log);
     }
 
-    // 1. Persist inbound as a message row + load context
+    // 1. Persist inbound as a message row + load context. Also cancel any
+    // pending follow-ups for this conversation — the customer just replied,
+    // so the queued reminder is no longer needed (v1 parity: "Cancel
+    // pending follow on" SQL).
     const inboundMessage = await this.persistInbound(envelope);
+    await query(
+      `UPDATE follow_on SET status='cancelada', cancel_reason='client_replied', cancelled_at=now()
+        WHERE conversation_id = $1 AND status = 'pendiente'`,
+      [envelope.conversationId],
+    ).catch((err) => log.warn({ err }, 'cancel pending follow-ups failed (non-fatal)'));
     const conversation = await this.loadConversation(envelope.conversationId);
     const settings = await this.loadSettings();
     const recent = await this.loadRecent(envelope.conversationId);

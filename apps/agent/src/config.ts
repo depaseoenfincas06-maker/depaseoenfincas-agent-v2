@@ -52,6 +52,12 @@ const envSchema = z.object({
    * dedicated value in production).
    */
   PDF_HMAC_SECRET: z.string().optional(),
+  /**
+   * Public-facing base URL for /api/reservation-confirmation.pdf — should
+   * point at the same Render service. Used to build customer-shareable
+   * links. Falls back to the conversation's settings.publicAppBaseUrl.
+   */
+  PUBLIC_APP_BASE_URL: z.string().url().optional(),
 
   /**
    * Client-facing WhatsApp number (the main agent). Currently +57 310 5639334.

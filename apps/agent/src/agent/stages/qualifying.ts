@@ -11,6 +11,7 @@ import type { StageDecision } from '@depf/shared';
 import type { StageHandler, StageInput } from './types.js';
 import { buildToneBlock, withStageAddendum } from './types.js';
 import { getLLM } from '../llm/index.js';
+import { buildGreetingContext } from '../greeting-context.js';
 
 const QUALIFYING_SYSTEM = `Eres el asistente conversacional de "De Paseo en Fincas", una empresa colombiana que renta fincas vacacionales. Estás en el estado QUALIFYING.
 
@@ -44,8 +45,22 @@ class QualifyingStage implements StageHandler {
   async handle(input: StageInput): Promise<StageDecision> {
     const llm = getLLM();
     const tone = buildToneBlock(input.settings);
+
+    // Greeting context: enriches the very first turn with a personalised
+    // saludo. v1 parity — when a brand new conversation lands in QUALIFYING
+    // we want "¡Buenas tardes, María!" not a generic opener.
+    const greeting = buildGreetingContext({
+      currentStage: input.conversation.currentStage,
+      recentMessageCount: input.recentMessages.length,
+      clientName: input.conversation.clientName,
+    });
+
+    const greetingBlock = greeting.isInitialQualifyingTurn
+      ? `\nCONTEXTO DEL SALUDO:\n- es_inicio: true (este es el primer mensaje de la conversación)\n- saludo_horario: "${greeting.greetingPhrase}" (Bogotá, ${greeting.timeBucket})\n- nombre_cliente: ${greeting.nameCandidate ? `"${greeting.nameCandidate}"` : 'desconocido — NO inventes uno'}\nUsa estos datos para construir un saludo natural ANTES de la primera pregunta.`
+      : '';
+
     const system = withStageAddendum(
-      QUALIFYING_SYSTEM.replace('{TONE_GUIDELINES}', tone),
+      QUALIFYING_SYSTEM.replace('{TONE_GUIDELINES}', tone) + greetingBlock,
       input.settings.promptAddenda?.qualifying,
     );
 

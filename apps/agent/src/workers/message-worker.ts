@@ -193,6 +193,13 @@ export const worker = new Worker<MessageJob>(MESSAGE_QUEUE_NAME, processJob, {
   concurrency: config.QUEUE_CONCURRENCY,
 });
 
+// Start the follow-up cron alongside the message worker so we have a single
+// long-lived process to deploy. It runs every 60s, skips outside the
+// 08:00–22:00 Bogotá window, and claims rows with FOR UPDATE SKIP LOCKED so
+// horizontal scaling is safe.
+import { startFollowupWorker } from './followup-worker.js';
+startFollowupWorker();
+
 worker.on('ready', () => logger.info('message worker ready'));
 worker.on('failed', (job, err) =>
   logger.error({ jobId: job?.id, err }, 'worker job failed'),

@@ -11,6 +11,8 @@ import { buildToneBlock, withStageAddendum } from './types.js';
 import { getLLM } from '../llm/index.js';
 import { getFincaById } from '../../inventory/loader.js';
 import { generateReservationPDF } from '../tools/generate-pdf.js';
+import { buildReservationPdfUrl } from '../reservation-pdf-url.js';
+import { config } from '../../config.js';
 import { logger } from '../../observability/logger.js';
 
 const CONFIRMING_SYSTEM = `Eres el asistente de "De Paseo en Fincas" en el estado CONFIRMING_RESERVATION.
@@ -117,34 +119,68 @@ class ConfirmingStage implements StageHandler {
     }
 
     if (complete && data.intent === 'DOCUMENT_READY' && finca) {
-      try {
-        const pdf = await generateReservationPDF({
-          finca,
-          reservation: merged as Record<string, string>,
-          searchCriteria: input.conversation.searchCriteria ?? {},
-          paymentMethods: (typeof input.settings.paymentMethods === 'object' && input.settings.paymentMethods !== null
-            ? (input.settings.paymentMethods as Record<string, unknown>)
-            : {}),
-        });
-        outbound.push({
-          channel: 'simulator',
-          type: 'document',
-          attachments: [
-            {
-              data: pdf.base64,
-              mimeType: 'application/pdf',
-              filename: pdf.filename,
-              caption: 'Confirmación de tu reserva',
-            },
-          ],
-        });
-      } catch (err) {
-        logger.error({ err }, 'pdf generation failed');
-        outbound.push({
-          channel: 'simulator',
-          type: 'text',
-          text: 'Tuve un inconveniente generando el PDF de confirmación. Un asesor te lo enviará en breve.',
-        });
+      // v1 parity: send a public, HMAC-signed URL to the reservation
+      // confirmation page. WhatsApp generates a link preview from the OG
+      // tags so the customer sees a card without clicking through.
+      // Falls back to an inline PDF if PUBLIC_APP_BASE_URL isn't set.
+      const baseUrl = input.settings.publicAppBaseUrl ?? config.PUBLIC_APP_BASE_URL ?? '';
+      const hmacSecret = config.PDF_HMAC_SECRET ?? config.WEBHOOK_SHARED_SECRET ?? '';
+      if (baseUrl && hmacSecret) {
+        try {
+          const paymentMethodsText =
+            typeof input.settings.paymentMethods === 'string'
+              ? input.settings.paymentMethods
+              : null;
+          const { url } = buildReservationPdfUrl({
+            finca,
+            reservation: merged as Record<string, string>,
+            searchCriteria: input.conversation.searchCriteria ?? {},
+            paymentMethodsText,
+            publicAppBaseUrl: baseUrl,
+            hmacSecret,
+          });
+          outbound.push({
+            channel: 'simulator',
+            type: 'text',
+            text: `Aquí está tu confirmación de reserva: ${url}`,
+          });
+        } catch (err) {
+          logger.error({ err }, 'pdf URL build failed — falling back to inline PDF');
+          // Fall through to binary PDF below
+        }
+      }
+      // Binary PDF fallback (or primary if URL config missing).
+      if (!baseUrl || !hmacSecret) {
+        try {
+          const pdf = await generateReservationPDF({
+            finca,
+            reservation: merged as Record<string, string>,
+            searchCriteria: input.conversation.searchCriteria ?? {},
+            paymentMethods:
+              typeof input.settings.paymentMethods === 'object' && input.settings.paymentMethods !== null
+                ? (input.settings.paymentMethods as Record<string, unknown>)
+                : {},
+          });
+          outbound.push({
+            channel: 'simulator',
+            type: 'document',
+            attachments: [
+              {
+                data: pdf.base64,
+                mimeType: 'application/pdf',
+                filename: pdf.filename,
+                caption: 'Confirmación de tu reserva',
+              },
+            ],
+          });
+        } catch (err) {
+          logger.error({ err }, 'pdf generation failed');
+          outbound.push({
+            channel: 'simulator',
+            type: 'text',
+            text: 'Tuve un inconveniente generando el PDF de confirmación. Un asesor te lo enviará en breve.',
+          });
+        }
       }
     }
 

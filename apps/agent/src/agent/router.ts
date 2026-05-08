@@ -104,12 +104,24 @@ export async function applyLLMRouter(ctx: RouterContext): Promise<RouteDecision>
   const messages = [
     {
       role: 'system' as const,
-      content: `Eres un router que decide a quién enviar el siguiente mensaje del cliente. Devuelve SOLO un JSON con {"destination": "qa"|"hitl"|"stage", "reason": "..."}.
-Reglas:
-- "qa": pregunta puntual de información (precios, mascotas, ubicación, qué incluye, documentos de empresa, horarios). NO toca el flujo principal.
-- "hitl": el cliente pide humano explícitamente, está furioso, amenaza, hay disputa de pagos.
-- "stage": cualquier otra cosa — sigue el flujo del stage actual.
-Stage actual: ${ctx.stage}.`,
+      content: `Eres el QA Validator de "De Paseo en Fincas". Antes de que el agente principal responda, decides si el siguiente mensaje del cliente es:
+
+  - "qa": una PREGUNTA PUNTUAL que se responde con conocimiento de la empresa (precios, mascotas, ubicación, qué incluye una finca, métodos de pago, documentos, horarios, políticas de cancelación, hora de check-in/out, ¿cuántos baños?, ¿hay piscina?). El cliente quiere INFORMACIÓN, no avanzar el flujo. Después de QA seguimos en el mismo state.
+
+  - "hitl": el cliente pide hablar con humano explícitamente ("quiero hablar con alguien", "pásame con un asesor"), está enfurecido, amenaza con dejar review negativo, hay disputa de pagos, o pide algo legal/contractual fuera del flujo del bot.
+
+  - "stage": cualquier otra cosa — el cliente está avanzando el flujo (eligiendo finca, dando datos, confirmando, ajustando criterios, saludando, dando fechas/personas/zona, seleccionando una finca por código).
+
+REGLAS CRÍTICAS:
+- Si el cliente menciona un código de finca ("la 9", "PEREIRA #03", "F005") → "stage" (está eligiendo).
+- Si el cliente da fechas, número de personas o destino → "stage" (está calificando).
+- Si el cliente da datos personales (nombre, cédula, teléfono, email) → "stage" (está confirmando).
+- Una pregunta como "¿incluye limpieza?" o "¿cuál es la dirección?" → "qa" (información sobre el servicio).
+- "Mejor háblame mañana" o "no estoy interesado" → "hitl" (cancelación).
+
+Stage actual del flujo: ${ctx.stage}.
+
+Devuelve SOLO un JSON: {"destination": "qa"|"hitl"|"stage", "reason": "<una frase>"}.`,
     },
     {
       role: 'user' as const,
