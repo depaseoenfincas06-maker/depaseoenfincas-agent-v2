@@ -326,6 +326,26 @@ export async function adminRoutes(app: FastifyInstance) {
     };
   });
 
+  // ---- webhook debug log ----
+  // Returns recent inbound webhook hits with auth/outcome details. The single
+  // most useful diagnostic for "is Chatwoot actually delivering?" — every hit
+  // creates a row regardless of auth/parse, so an empty list means Chatwoot
+  // simply isn't sending us anything.
+  app.get('/webhook-debug', async (req) => {
+    const q = req.query as { limit?: string };
+    const limit = Math.min(parseInt(q.limit ?? '50', 10) || 50, 200);
+    const r = await pool.query(
+      `SELECT id, path, method, remote_ip, user_agent, content_type,
+              content_length, has_chatwoot_signature, has_webhook_secret_header,
+              auth_result, outcome, body_preview, created_at
+         FROM webhook_debug_log
+         ORDER BY created_at DESC
+         LIMIT $1`,
+      [limit],
+    );
+    return r.rows;
+  });
+
   // ---- health ----
   app.get('/health-detailed', async () => {
     const dbOk = await pool

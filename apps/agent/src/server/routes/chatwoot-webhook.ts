@@ -284,11 +284,52 @@ function verifyAuth(req: FastifyRequest): { ok: true } | { ok: false; reason: st
   };
 }
 
+/**
+ * Persist a debug log row for EVERY incoming hit, before any auth or parse.
+ * Read via /api/webhook-debug to confirm whether Chatwoot is delivering at
+ * all and what auth state results from each hit. Best-effort — failures here
+ * are logged but never block request processing.
+ */
+async function logDebugHit(
+  req: FastifyRequest,
+  authResult: string,
+  outcome: string,
+): Promise<void> {
+  try {
+    const body = (req as unknown as { rawBody?: string }).rawBody ?? '';
+    const headers = req.headers as Record<string, string | string[] | undefined>;
+    await pool.query(
+      `INSERT INTO webhook_debug_log
+        (path, method, remote_ip, user_agent, content_type, content_length,
+         has_chatwoot_signature, has_webhook_secret_header,
+         auth_result, outcome, body_preview, headers_json)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::jsonb)`,
+      [
+        req.url,
+        req.method,
+        req.ip,
+        String(headers['user-agent'] ?? ''),
+        String(headers['content-type'] ?? ''),
+        body.length,
+        Boolean(headers['x-chatwoot-signature']),
+        Boolean(headers['x-webhook-secret']),
+        authResult,
+        outcome,
+        body.slice(0, 1000),
+        JSON.stringify(headers),
+      ],
+    );
+  } catch (err) {
+    req.log.warn({ err }, 'webhook debug log insert failed (non-fatal)');
+  }
+}
+
 export async function chatwootWebhookRoutes(app: FastifyInstance) {
   app.post('/chatwoot', async (req, reply) => {
     const auth = verifyAuth(req);
     if (!auth.ok) {
       req.log.warn({ reason: auth.reason }, 'chatwoot webhook auth failed');
+      await logDebugHit(req, auth.reason, 'unauthorized');
       return reply.unauthorized(auth.reason);
     }
 
@@ -312,6 +353,7 @@ export async function chatwootWebhookRoutes(app: FastifyInstance) {
           { strictReason: normalized.reason, flexReason: flex.reason, found: flex.found },
           'webhook ignored — neither strict nor flexible could normalize',
         );
+        await logDebugHit(req, 'auth-ok', 'ignored');
         return reply.send({ ok: true, ignored: true, reason: `strict=${normalized.reason}; flex=${flex.reason}` });
       }
       req.log.info({ strictReason: normalized.reason, waId: flex.waId }, 'flexible normalizer rescued the payload');
@@ -336,6 +378,7 @@ export async function chatwootWebhookRoutes(app: FastifyInstance) {
       );
       if (existing.rows.length > 0) {
         req.log.info({ externalMessageId: normalized.externalMessageId }, 'duplicate chatwoot webhook — already processed');
+        await logDebugHit(req, 'auth-ok', 'duplicate');
         return reply.send({ ok: true, duplicate: true });
       }
     }
@@ -365,6 +408,7 @@ export async function chatwootWebhookRoutes(app: FastifyInstance) {
       enqueuedAt: new Date().toISOString(),
     });
 
+    await logDebugHit(req, 'auth-ok', 'processed');
     return reply.send({ ok: true, inboxId });
   });
 }
