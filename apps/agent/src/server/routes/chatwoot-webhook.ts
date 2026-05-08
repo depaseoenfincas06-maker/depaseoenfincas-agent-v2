@@ -359,6 +359,75 @@ async function logDebugHit(
   }
 }
 
+/**
+ * Inspect the raw body for a `conversation_updated` event carrying
+ * custom_attributes.ia_activa, and sync it into our local conversations row.
+ * Returns true if the event was recognized + handled (caller should ack with
+ * 200), false if it's a normal message_created event we should keep
+ * processing.
+ *
+ * v1 parity: this is the path that lets a human flip a switch in Chatwoot's
+ * UI and have the bot stop responding for that conversation. Chatwoot fires
+ * conversation_updated with the full conversation object; we read
+ * custom_attributes.ia_activa (and a couple of common variants) and set
+ * conversations.agente_activo.
+ */
+async function tryHandleConversationUpdated(
+  body: unknown,
+): Promise<{ handled: boolean; reason?: string }> {
+  if (!body || typeof body !== 'object') return { handled: false };
+  const b = body as Record<string, unknown>;
+  const event = String(b.event ?? '');
+  if (event !== 'conversation_updated') return { handled: false };
+
+  const conv = (b.conversation ?? b) as Record<string, unknown>;
+  const customAttrs =
+    (conv.custom_attributes as Record<string, unknown> | undefined) ??
+    ((conv.additional_attributes as Record<string, unknown> | undefined) ?? {});
+  const chatwootId = conv.id != null ? Number(conv.id) : null;
+  const contactInbox = (conv.contact_inbox ?? {}) as Record<string, unknown>;
+  const sourceId = contactInbox.source_id ?? (conv.meta as Record<string, unknown> | undefined)?.sender;
+  let waId: string | null = null;
+  if (typeof sourceId === 'string' && /^\d+$/.test(sourceId)) waId = sourceId;
+  else if (sourceId && typeof sourceId === 'object') {
+    const ident = (sourceId as Record<string, unknown>).identifier;
+    if (typeof ident === 'string' && /^\d+$/.test(ident)) waId = ident;
+  }
+
+  if (!chatwootId && !waId) {
+    return { handled: true, reason: 'conversation_updated without id or wa_id — ignored' };
+  }
+
+  // Coerce the ia_activa attribute. Treat literal strings ("true"/"false"/
+  // "si"/"no") tolerantly because Chatwoot custom attributes are usually
+  // stored as strings via the UI.
+  const raw = customAttrs.ia_activa ?? customAttrs.iaActiva ?? customAttrs['IA Activa'];
+  if (raw === undefined) {
+    return { handled: true, reason: 'conversation_updated without ia_activa — ignored' };
+  }
+  let iaActiva: boolean;
+  if (typeof raw === 'boolean') iaActiva = raw;
+  else if (typeof raw === 'string') {
+    const v = raw.trim().toLowerCase();
+    iaActiva = v === 'true' || v === 'si' || v === 'sí' || v === '1' || v === 'yes' || v === 'on';
+  } else iaActiva = Boolean(raw);
+
+  // Update by chatwoot_conversation_id when we have it; otherwise by wa_id.
+  if (chatwootId) {
+    await pool.query(
+      `UPDATE conversations SET agente_activo = $1 WHERE chatwoot_conversation_id = $2`,
+      [iaActiva, chatwootId],
+    );
+  } else if (waId) {
+    await pool.query(
+      `INSERT INTO conversations (wa_id, agente_activo) VALUES ($1, $2)
+         ON CONFLICT (wa_id) DO UPDATE SET agente_activo = EXCLUDED.agente_activo`,
+      [waId, iaActiva],
+    );
+  }
+  return { handled: true, reason: `synced ia_activa=${iaActiva} for chatwootId=${chatwootId ?? '?'} waId=${waId ?? '?'}` };
+}
+
 export async function chatwootWebhookRoutes(app: FastifyInstance) {
   app.post('/chatwoot', async (req, reply) => {
     const auth = verifyAuth(req);
@@ -366,6 +435,16 @@ export async function chatwootWebhookRoutes(app: FastifyInstance) {
       req.log.warn({ reason: auth.reason }, 'chatwoot webhook auth failed');
       await logDebugHit(req, auth.reason, 'unauthorized', auth.signatureRaw, auth.computedHmac);
       return reply.unauthorized(auth.reason);
+    }
+
+    // v1 parity: handle conversation_updated events (ia_activa toggle) before
+    // running the message normalizer, since these events don't carry a
+    // message at all and would otherwise be skipped.
+    const sync = await tryHandleConversationUpdated(req.body);
+    if (sync.handled) {
+      req.log.info({ reason: sync.reason }, 'conversation_updated handled');
+      await logDebugHit(req, auth.reason, 'sync_ia_activa', auth.signatureRaw, auth.computedHmac);
+      return reply.send({ ok: true, sync: sync.reason });
     }
 
     const parsed = chatwootMessagePayloadSchema.safeParse(req.body);

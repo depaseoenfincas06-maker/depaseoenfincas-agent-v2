@@ -262,6 +262,64 @@ class ChatwootChannel implements ChannelAdapter {
       raw: data,
     };
   }
+
+  /**
+   * PATCH custom_attributes on a Chatwoot conversation. Used by the
+   * ia_activa sync: when the agent locally changes agente_activo on a
+   * conversation (e.g. customer asks to talk to a human → HITL → flip to
+   * false), we propagate that to Chatwoot so the team sees the same flag.
+   *
+   * Endpoint: PATCH /api/v1/accounts/{aid}/conversations/{cid}/custom_attributes
+   * Body: { custom_attributes: { ia_activa: boolean } }
+   *
+   * Best-effort. If Chatwoot is down or the conversation doesn't exist, we
+   * log + swallow — the local row is the source of truth for runtime, and
+   * a later webhook will reconcile.
+   */
+  async patchCustomAttributes(
+    chatwootConversationId: number,
+    attributes: Record<string, unknown>,
+  ): Promise<{ ok: boolean; reason?: string }> {
+    if (!config.CHATWOOT_API_TOKEN) {
+      return { ok: false, reason: 'CHATWOOT_API_TOKEN not configured' };
+    }
+    const url = `${this.baseUrl}/api/v1/accounts/${config.CHATWOOT_ACCOUNT_ID}/conversations/${chatwootConversationId}/custom_attributes`;
+    try {
+      const res = await request(url, {
+        method: 'POST',
+        headers: {
+          api_access_token: config.CHATWOOT_API_TOKEN!,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ custom_attributes: attributes }),
+      });
+      if (res.statusCode >= 400) {
+        let bodyText = '';
+        try {
+          bodyText = await res.body.text();
+        } catch {
+          /* ignore */
+        }
+        const reason = `chatwoot patch_custom_attributes ${res.statusCode}: ${bodyText.slice(0, 200)}`;
+        logger.warn(
+          { statusCode: res.statusCode, url, chatwootConversationId },
+          'chatwoot custom_attributes patch failed',
+        );
+        return { ok: false, reason };
+      }
+      // Drain body so the connection is freed.
+      try {
+        await res.body.text();
+      } catch {
+        /* ignore */
+      }
+      return { ok: true };
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      logger.warn({ err, chatwootConversationId }, 'chatwoot custom_attributes patch threw');
+      return { ok: false, reason };
+    }
+  }
 }
 
 export const chatwootChannel = new ChatwootChannel();

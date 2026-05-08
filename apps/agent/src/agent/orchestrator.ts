@@ -28,6 +28,7 @@ import { applyAlwaysRespondGuard } from '../observability/fallback-guard.js';
 import { logger } from '../observability/logger.js';
 import { withTx, query } from '../persistence/db.js';
 import { getChannel } from '../channels/index.js';
+import { chatwootChannel } from '../channels/chatwoot.js';
 
 interface InboundEnvelope {
   channel: Channel;
@@ -63,6 +64,44 @@ export interface OrchestratorResult {
   traceId: string;
   status: 'ok' | 'silent' | 'fallback' | 'error';
   outboundCount: number;
+}
+
+/** Business stages an auto-loop is allowed to land on. HITL is excluded —
+ *  if a hop produces next_stage=HITL we want to deliver the handoff outbound
+ *  immediately, not re-run. */
+const AUTO_LOOP_STAGES: Set<Stage> = new Set([
+  'QUALIFYING',
+  'OFFERING',
+  'VERIFYING_AVAILABILITY',
+  'CONFIRMING_RESERVATION',
+]);
+
+/** Combine two extracted_data patches, with the later one winning on
+ *  conflicting scalar keys but unioning array keys (zona/ciudad/amenidades).
+ *  Used inside the auto-loop to accumulate criteria across hops. */
+function mergeExtractedData(
+  prev: Record<string, unknown>,
+  next: Record<string, unknown>,
+): Record<string, unknown> {
+  const out: Record<string, unknown> = { ...prev };
+  for (const [k, v] of Object.entries(next)) {
+    if (v == null) continue;
+    if (Array.isArray(v) && Array.isArray(out[k])) {
+      // Union of arrays, dedup by lower-cased string compare.
+      const seen = new Set<string>();
+      const merged: unknown[] = [];
+      for (const item of [...(out[k] as unknown[]), ...v]) {
+        const key = String(item).toLowerCase().trim();
+        if (seen.has(key)) continue;
+        seen.add(key);
+        merged.push(item);
+      }
+      out[k] = merged;
+    } else {
+      out[k] = v;
+    }
+  }
+  return out;
 }
 
 /** Detect the v1 RESET command. Case-insensitive, trim-tolerant; only the
@@ -293,51 +332,106 @@ export class Orchestrator {
         trace,
       }));
 
+    // Auto-loop: when the LLM moves us from QUALIFYING → OFFERING (or any
+    // business-state transition), v1 re-runs the next stage immediately
+    // before replying to the user. That lets the same inbound first save
+    // criteria via QUALIFYING and then immediately produce the property
+    // cards via OFFERING — without forcing the customer to send another
+    // message just to see what they qualified for. Cap at 3 hops to match
+    // v1's max_iterations.
     let outbound: OutboundMessage[] = [];
     let nextStage: Stage = conversation.currentStage;
     let intent: Intent | null = null;
     let extractedData: Record<string, unknown> = {};
     let fallbackReason: 'STAGE_HANDLER_THREW' | 'TOOL_LOOP_EXHAUSTED' | undefined;
+    let runningConversation = conversation;
+    let routeForThisHop: typeof route | null = route;
 
-    try {
-      const stageInput: StageInput = {
-        userText,
-        recentMessages: recent,
-        conversation,
-        settings,
-        trace,
-      };
-      let decision;
-      if (route.destination === 'hitl') {
-        decision = await getStageHandler('HITL').handle(stageInput);
-      } else if (route.destination === 'qa') {
-        log.info({ reason: route.reason, confidence: route.confidence }, 'routed to QA');
-        decision = await qaStage.handle(stageInput);
-      } else {
-        decision = await this.runStage(conversation.currentStage, stageInput);
+    const MAX_AUTO_LOOP_HOPS = 3;
+    for (let hop = 0; hop < MAX_AUTO_LOOP_HOPS; hop += 1) {
+      try {
+        const stageInput: StageInput = {
+          userText,
+          recentMessages: recent,
+          conversation: runningConversation,
+          settings,
+          trace,
+        };
+        let decision;
+        // QA / HITL routing only applies on the FIRST hop (when the user's
+        // own text is the input). Subsequent auto-loop hops always go to
+        // the new stage handler — we already decided "this is a business
+        // state transition" and shouldn't second-guess that with another
+        // QA classifier pass.
+        if (hop === 0 && routeForThisHop?.destination === 'hitl') {
+          decision = await getStageHandler('HITL').handle(stageInput);
+        } else if (hop === 0 && routeForThisHop?.destination === 'qa') {
+          log.info(
+            { reason: routeForThisHop.reason, confidence: routeForThisHop.confidence },
+            'routed to QA',
+          );
+          decision = await qaStage.handle(stageInput);
+        } else {
+          decision = await this.runStage(runningConversation.currentStage, stageInput);
+        }
+        intent = decision.intent;
+        nextStage = decision.nextStage;
+        extractedData = mergeExtractedData(extractedData, decision.extractedData ?? {});
+        // Each hop's outbound is concatenated. Most hops produce nothing
+        // (e.g. QUALIFYING just saves criteria → blank reply); the final
+        // OFFERING hop emits the cards.
+        outbound = outbound.concat(
+          decision.outbound.map(
+            (m: OutboundMessage): OutboundMessage => ({ ...m, channel: envelope.channel }),
+          ),
+        );
+      } catch (err) {
+        log.error({ err, hop }, 'stage handler threw');
+        fallbackReason = 'STAGE_HANDLER_THREW';
+        await trace.recordTurn({
+          stage: runningConversation.currentStage,
+          model: 'n/a',
+          prompt: { userText, hop },
+          response: null,
+          toolsCalled: [],
+          tokensIn: null,
+          tokensOut: null,
+          costUsd: null,
+          latencyMs: null,
+          status: 'error',
+          errorDetail: { message: err instanceof Error ? err.message : String(err) },
+        });
+        break;
       }
-      intent = decision.intent;
-      nextStage = decision.nextStage;
-      extractedData = decision.extractedData ?? {};
-      outbound = decision.outbound.map(
-        (m: OutboundMessage): OutboundMessage => ({ ...m, channel: envelope.channel }),
+
+      // Decide whether to auto-loop for another hop.
+      const stageChanged = nextStage !== runningConversation.currentStage;
+      const isBusinessTransition = AUTO_LOOP_STAGES.has(nextStage);
+      const producedOutbound = outbound.length > 0;
+      // v1 rule: only auto-loop when the LLM signals we should, by emitting
+      // a stage change AND not producing customer-facing outbound (or only
+      // producing the silent "ok let me look that up" preamble). When the
+      // stage handler ALREADY produced outbound, we should ship it — the
+      // user is waiting. When it produced nothing AND moved the state,
+      // that's the signal to re-run on the new stage in the same turn.
+      const shouldLoop =
+        stageChanged && isBusinessTransition && !producedOutbound && hop + 1 < MAX_AUTO_LOOP_HOPS;
+      if (!shouldLoop) break;
+
+      log.info(
+        { fromStage: runningConversation.currentStage, toStage: nextStage, hop },
+        'auto-loop: re-running on next stage in same turn',
       );
-    } catch (err) {
-      log.error({ err }, 'stage handler threw');
-      fallbackReason = 'STAGE_HANDLER_THREW';
-      await trace.recordTurn({
-        stage: conversation.currentStage,
-        model: 'n/a',
-        prompt: { userText },
-        response: null,
-        toolsCalled: [],
-        tokensIn: null,
-        tokensOut: null,
-        costUsd: null,
-        latencyMs: null,
-        status: 'error',
-        errorDetail: { message: err instanceof Error ? err.message : String(err) },
-      });
+
+      // Persist the criteria update from the prior hop so the next stage
+      // handler sees it in `conversation.searchCriteria`.
+      await this.persistConversationUpdate(
+        envelope.conversationId,
+        nextStage,
+        extractedData,
+      );
+      runningConversation = await this.loadConversation(envelope.conversationId);
+      routeForThisHop = null;
     }
 
     // 3. Always-respond guard
@@ -354,8 +448,7 @@ export class Orchestrator {
     // 4. Deliver outbound
     await this.deliverOutbound(envelope.conversationId, guard.outbound, trace.id);
 
-    // 5. Persist conversation update — merge extracted_data into search_criteria
-    // and reservation as appropriate.
+    // 5. Persist final conversation update.
     await this.persistConversationUpdate(envelope.conversationId, nextStage, extractedData);
 
     await trace.finalize({
@@ -749,7 +842,10 @@ export class Orchestrator {
     const currentCriteria = cur.rows[0]?.search_criteria ?? {};
     const mergedCriteria = mergeCriteriaWithCurrent(currentCriteria, criteriaPatch);
 
-    await query(
+    const updated = await query<{
+      agente_activo: boolean;
+      chatwoot_conversation_id: number | null;
+    }>(
       `UPDATE conversations
           SET current_stage = $2,
               search_criteria = $3::jsonb,
@@ -761,7 +857,8 @@ export class Orchestrator {
                 ELSE shown_fincas
               END,
               agente_activo = CASE WHEN $2 = 'HITL' THEN false ELSE agente_activo END
-        WHERE wa_id = $1`,
+        WHERE wa_id = $1
+        RETURNING agente_activo, chatwoot_conversation_id`,
       [
         conversationId,
         nextStage,
@@ -770,6 +867,20 @@ export class Orchestrator {
         chosenFincaId ?? null,
       ],
     );
+
+    // ia_activa outbound sync: if we just flipped agente_activo (most
+    // commonly to false on HITL), propagate to Chatwoot's custom_attributes
+    // so the team sees the same state in the inbox UI. Best-effort.
+    const row = updated.rows[0];
+    if (row && row.chatwoot_conversation_id != null) {
+      // Only patch when transitioning into HITL — that's when the local
+      // value just changed. Avoid spamming Chatwoot on every business turn.
+      if (nextStage === 'HITL' && row.agente_activo === false) {
+        chatwootChannel
+          .patchCustomAttributes(Number(row.chatwoot_conversation_id), { ia_activa: false })
+          .catch((err) => logger.warn({ err }, 'ia_activa outbound sync failed'));
+      }
+    }
   }
 }
 
