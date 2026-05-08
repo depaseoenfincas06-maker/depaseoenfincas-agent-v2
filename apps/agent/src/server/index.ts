@@ -5,6 +5,7 @@ import multipart from '@fastify/multipart';
 import { config } from '../config.js';
 import { logger } from '../observability/logger.js';
 import { pool } from '../persistence/db.js';
+import { up as runMigrations } from '../persistence/migrate.js';
 import { webhookRoutes } from './routes/webhook.js';
 import { chatwootWebhookRoutes } from './routes/chatwoot-webhook.js';
 import { adminRoutes } from './routes/admin.js';
@@ -58,6 +59,21 @@ async function buildServer() {
 }
 
 async function start() {
+  // Auto-apply pending migrations on boot so a fresh deploy picks up new
+  // schema without a manual run. Idempotent — applied migrations are
+  // tracked in the _migrations table. If a migration fails the server
+  // refuses to start (we'd rather take downtime than serve traffic with a
+  // mismatched schema).
+  if (process.env.AUTO_MIGRATE_ON_BOOT !== 'false') {
+    try {
+      const result = await runMigrations();
+      logger.info(result, 'boot migrations complete');
+    } catch (err) {
+      logger.error({ err }, 'boot migrations failed — refusing to start');
+      process.exit(1);
+    }
+  }
+
   const app = await buildServer();
   // Render / Heroku / Fly inject $PORT — bind to it when present so the
   // platform's load balancer can reach us. Falls back to AGENT_HTTP_PORT

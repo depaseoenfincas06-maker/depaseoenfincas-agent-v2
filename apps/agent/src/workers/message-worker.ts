@@ -19,12 +19,15 @@ import { orchestrator } from '../agent/orchestrator.js';
 import { transcribe, buildDomainPrompt } from '../media/transcribe.js';
 import { downloadMedia } from '../media/download.js';
 import { loadFincas } from '../inventory/loader.js';
+import { chatwootChannel } from '../channels/chatwoot.js';
 import type { Channel, TranscriptionStatus } from '@depf/shared';
 
 interface InboundPayload {
   channel: Channel;
   conversationId: string;
   externalMessageId?: string;
+  chatwootConversationId?: number;
+  inboxId?: number;
   waId?: string;
   clientName?: string;
   text?: string;
@@ -126,6 +129,31 @@ async function processJob(job: { id?: string; data: MessageJob }) {
     // (or an explicit empty/failed flag) — never a half-baked audio.
     let text = payload.text ?? null;
     let transcriptionStatus: TranscriptionStatus = payload.transcriptionStatus ?? null;
+
+    // Fallback: if we have NO media URL but we DO have a chatwoot
+    // conversation ID, ask Chatwoot for the latest audio attachment. This
+    // covers the case where the webhook fired before Chatwoot had finished
+    // processing the audio file (some versions of Chatwoot send the
+    // message_created event before the attachment URL is ready).
+    if (
+      !payload.media?.url &&
+      (!text || text.trim().length === 0) &&
+      // Heuristic: we suspect this might be an audio-only inbound when no
+      // text exists. If the original payload had no text at all, try the
+      // fallback.
+      payload.chatwootConversationId
+    ) {
+      const cid = Number(payload.chatwootConversationId);
+      const resolved = await chatwootChannel.resolveLatestAudioAttachment(cid);
+      if (resolved) {
+        log.info(
+          { chatwootConversationId: cid, mimeType: resolved.mimeType },
+          'audio fallback: resolved attachment via Chatwoot API',
+        );
+        payload.media = { url: resolved.url, mimeType: resolved.mimeType };
+      }
+    }
+
     if (payload.media?.url && (!text || text.trim().length === 0) && /audio|video/.test(payload.media.mimeType)) {
       try {
         const media = await downloadMedia(payload.media.url, payload.media.mimeType);

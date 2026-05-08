@@ -264,6 +264,66 @@ class ChatwootChannel implements ChannelAdapter {
   }
 
   /**
+   * Fetch a single conversation's most recent inbound audio attachment URL
+   * from Chatwoot. Used as a fallback when the webhook delivered an
+   * audio message but the data_url was missing (some Chatwoot versions
+   * send the attachment in a follow-up payload instead of inline).
+   *
+   * Returns the attachment URL + mime type, or null if no recent audio
+   * attachment can be found.
+   */
+  async resolveLatestAudioAttachment(
+    chatwootConversationId: number,
+  ): Promise<{ url: string; mimeType: string } | null> {
+    if (!config.CHATWOOT_API_TOKEN) return null;
+    const url = `${this.baseUrl}/api/v1/accounts/${config.CHATWOOT_ACCOUNT_ID}/conversations/${chatwootConversationId}/messages`;
+    try {
+      const res = await request(url, {
+        method: 'GET',
+        headers: { api_access_token: config.CHATWOOT_API_TOKEN },
+      });
+      if (res.statusCode >= 400) {
+        logger.warn(
+          { statusCode: res.statusCode, chatwootConversationId },
+          'chatwoot fetch messages failed',
+        );
+        return null;
+      }
+      const data = (await res.body.json()) as {
+        payload?: Array<{
+          message_type?: number | string;
+          attachments?: Array<{ data_url?: string; file_type?: string }>;
+        }>;
+      };
+      const messages = data?.payload ?? [];
+      // Walk newest-first looking for an inbound (message_type=0) message
+      // with at least one audio/video attachment.
+      for (let i = messages.length - 1; i >= 0; i -= 1) {
+        const m = messages[i]!;
+        const isInbound = m.message_type === 0 || m.message_type === '0';
+        if (!isInbound) continue;
+        const att = (m.attachments ?? []).find((a) =>
+          /audio|video/.test(String(a.file_type ?? '')),
+        );
+        if (att?.data_url) {
+          const ft = String(att.file_type ?? '');
+          const mime =
+            ft === 'audio'
+              ? 'audio/ogg'
+              : ft === 'video'
+                ? 'video/mp4'
+                : 'application/octet-stream';
+          return { url: att.data_url, mimeType: mime };
+        }
+      }
+      return null;
+    } catch (err) {
+      logger.warn({ err, chatwootConversationId }, 'chatwoot fetch messages threw');
+      return null;
+    }
+  }
+
+  /**
    * PATCH custom_attributes on a Chatwoot conversation. Used by the
    * ia_activa sync: when the agent locally changes agente_activo on a
    * conversation (e.g. customer asks to talk to a human → HITL → flip to

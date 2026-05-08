@@ -31,7 +31,7 @@ async function listApplied(): Promise<Set<string>> {
   return new Set(r.rows.map((row) => row.name));
 }
 
-async function up() {
+export async function up(): Promise<{ appliedCount: number; total: number }> {
   await ensureRegistry();
   const files = await listFiles();
   const applied = await listApplied();
@@ -47,6 +47,7 @@ async function up() {
     appliedCount += 1;
   }
   logger.info({ appliedCount, total: files.length }, 'migrations done');
+  return { appliedCount, total: files.length };
 }
 
 async function down() {
@@ -58,18 +59,26 @@ async function down() {
   );
 }
 
-const cmd = process.argv[2] ?? 'up';
+// Only run as CLI when this file is the direct entry point (NOT when
+// imported by server/index.ts for boot-time auto-migration).
+const isMainModule =
+  import.meta.url === `file://${process.argv[1]}` ||
+  process.argv[1]?.endsWith('migrate.ts') ||
+  process.argv[1]?.endsWith('migrate.js');
 
-(async () => {
-  try {
-    if (cmd === 'up') await up();
-    else if (cmd === 'down') await down();
-    else throw new Error(`Unknown command: ${cmd}`);
-    await pool.end();
-    process.exit(0);
-  } catch (err) {
-    logger.error({ err }, 'migration failed');
-    await pool.end();
-    process.exit(1);
-  }
-})();
+if (isMainModule) {
+  const cmd = process.argv[2] ?? 'up';
+  (async () => {
+    try {
+      if (cmd === 'up') await up();
+      else if (cmd === 'down') await down();
+      else throw new Error(`Unknown command: ${cmd}`);
+      await pool.end();
+      process.exit(0);
+    } catch (err) {
+      logger.error({ err }, 'migration failed');
+      await pool.end();
+      process.exit(1);
+    }
+  })();
+}
