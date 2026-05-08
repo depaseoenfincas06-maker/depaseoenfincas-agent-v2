@@ -194,6 +194,21 @@ export const stageDecisionSchema = z.preprocess(
     tool_calls: z.array(toolCallSchema).default([]),
     reasoning: z.string().default(''),
     done: z.boolean().default(true),
+    // OFFERING-specific: structured list of fincas the agent decided to show.
+    // The orchestrator turns each entry into a {card_text + media_group}
+    // sequence so the user sees a formatted card with emoji highlights and
+    // the photos. The LLM populates this when intent='SHOW_OPTIONS'.
+    fincas_mostradas: z.array(z.record(z.unknown())).optional(),
+    // OFFERING + VERIFYING + CONFIRMING + QA: the chosen finca object.
+    selected_finca: z.record(z.unknown()).nullable().optional(),
+    finca_elegida_id: z.string().nullable().optional(),
+    // CONFIRMING-specific: titular data updates collected this turn.
+    confirmation_data_update: z.record(z.unknown()).optional(),
+    // QA-specific: documents the agent decided to send as attachments.
+    documents_to_send: z.array(z.record(z.unknown())).optional(),
+    // OFFERING + QA: search criteria refinement (excludes etc.) the agent
+    // wants merged into conversations.search_criteria.
+    search_criteria_update: z.record(z.unknown()).optional(),
   }),
 );
 

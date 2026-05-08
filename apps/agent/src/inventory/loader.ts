@@ -72,6 +72,16 @@ function parseBool(value: string | undefined): boolean {
   return ['si', 'sí', 'yes', 'true', '1', 'permitidas', 'permitido'].includes(v);
 }
 
+/**
+ * Convert a CSV row to a Finca, populating BOTH the canonical (v2) fields and
+ * the v1-compatible snake_case fields the matcher reads. The Google Sheet
+ * uses the v1 column names (finca_id, codigo_original, precio_noche_base,
+ * precio_fin_semana, foto_url, owner_contacto, etc.) so the matcher can
+ * read them directly without remapping.
+ *
+ * Filters out rows with `activa=false` or `review_status != READY_FOR_OFFERING`
+ * — same gate as v1.
+ */
 function rowToFinca(headers: string[], cells: string[]): Finca | null {
   const get = (key: string) => {
     const idx = headers.findIndex((h) => h.toLowerCase().trim() === key.toLowerCase());
@@ -79,25 +89,69 @@ function rowToFinca(headers: string[], cells: string[]): Finca | null {
   };
   const fincaId = get('finca_id') || get('id') || get('codigo');
   if (!fincaId) return null;
+  // Apply v1 filters: only active fincas that are ready to be offered.
+  const activa = parseBool(get('activa')) || get('activa') === '';
+  const reviewStatus = (get('review_status') || '').toUpperCase().trim();
+  if (!activa) return null;
+  if (reviewStatus && reviewStatus !== 'READY_FOR_OFFERING') return null;
+
   const realName = get('nombre') || get('nombre_finca') || fincaId;
   const raw: Record<string, unknown> = {};
   headers.forEach((h, i) => {
     raw[h] = cells[i] ?? '';
   });
+
+  // CSV often stores foto_url as a single URL or comma-separated list.
+  const fotoUrlRaw = get('foto_url') || get('fotos') || get('imagenes');
+  const fotos = parseList(fotoUrlRaw);
+
+  // amenities + tipo_evento can appear as either CSV string or JSON-ish.
+  const amenidades = parseList(get('amenidades_csv') || get('amenidades') || '');
+  const tipoEvento = parseList(get('tipo_evento_csv') || get('tipo_evento') || '');
+
   return {
+    // Canonical fields
     fincaId,
     realName,
     zona: get('zona') || get('region') || '',
-    ciudad: get('ciudad') || get('municipio') || undefined,
+    ciudad: get('municipio') || get('ciudad') || undefined,
     capacidadMin: parseNumber(get('capacidad_min')),
     capacidadMax: parseNumber(get('capacidad_max')) ?? parseNumber(get('capacidad')) ?? 0,
-    precioPorNoche: parseNumber(get('precio_por_noche')) ?? parseNumber(get('precio_noche')),
-    precioPorPersona: parseNumber(get('precio_por_persona')),
-    amenidades: parseList(get('amenidades')),
-    mascotas: parseBool(get('mascotas')),
-    fotos: parseList(get('fotos')) ?? parseList(get('imagenes')),
-    descripcionCorta: get('descripcion') || get('descripcion_corta') || undefined,
+    precioPorNoche: parseNumber(get('precio_por_noche')) ?? parseNumber(get('precio_noche_base')) ?? parseNumber(get('precio_noche')),
+    precioPorPersona: parseNumber(get('precio_por_persona')) ?? parseNumber(get('precio_persona_extra')),
+    amenidades,
+    mascotas: parseBool(get('pet_friendly') || get('mascotas')),
+    fotos,
+    descripcionCorta: get('descripcion_corta') || get('descripcion') || undefined,
     raw,
+
+    // v1 snake_case (read directly by match.ts and finca-card.ts)
+    codigo_original: get('codigo_original') || undefined,
+    capacidad_minima_tarifa: parseNumber(get('capacidad_minima_tarifa')) ?? undefined,
+    habitaciones: parseNumber(get('habitaciones')) ?? undefined,
+    min_noches: parseNumber(get('min_noches')) ?? 1,
+    precio_noche_base: parseNumber(get('precio_noche_base')) ?? undefined,
+    precio_fin_semana: parseNumber(get('precio_fin_semana')) ?? undefined,
+    precio_festivo: parseNumber(get('precio_festivo')) ?? undefined,
+    precio_semana_santa_receso: parseNumber(get('precio_semana_santa_receso')) ?? undefined,
+    precio_temporada_alta: parseNumber(get('precio_temporada_alta')) ?? undefined,
+    precio_persona_extra: parseNumber(get('precio_persona_extra')) ?? 0,
+    pet_friendly: parseBool(get('pet_friendly') || get('mascotas')),
+    tipo_evento: tipoEvento,
+    foto_url: fotoUrlRaw || undefined,
+    owner_nombre: get('owner_nombre') || undefined,
+    owner_contacto: get('owner_contacto') || undefined,
+    descuento_max_pct: parseNumber(get('descuento_max_pct')) ?? 0,
+    especificacion_habitaciones: get('especificacion_habitaciones') || undefined,
+    observaciones_originales: get('observaciones_originales') || undefined,
+    caracteristicas_originales: get('caracteristicas_originales') || undefined,
+    deposito_seguridad: parseNumber(get('deposito_seguridad')) ?? 0,
+    empleadas: parseNumber(get('empleadas')) ?? undefined,
+    administrador_nombre: get('administrador_nombre') || undefined,
+    administrador_contacto: get('administrador_contacto') || undefined,
+    pricing_model: get('pricing_model') || undefined,
+    review_notes: get('review_notes') || undefined,
+    prioridad: parseNumber(get('prioridad')) ?? 999,
   };
 }
 

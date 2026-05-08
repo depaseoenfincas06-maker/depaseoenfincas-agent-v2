@@ -40,11 +40,21 @@ class ChatwootChannel implements ChannelAdapter {
       return { delivered: false, failureReason: reason };
     }
 
-    const url = `${this.baseUrl}/api/v1/accounts/${config.CHATWOOT_ACCOUNT_ID}/conversations/${ctx.chatwootConversationId}/messages`;
+    // Route by message type. Plain text → /messages JSON. Media → either
+    // a sequence of attachment_urls (for image/document) or a multipart upload.
+    if (message.type === 'media_group' || message.type === 'image' || message.type === 'document') {
+      return this.sendMediaMessage(ctx, message);
+    }
 
-    // Attachments: Chatwoot wants multipart for media. For now we send text
-    // (and document/image URLs as content_attributes). Multipart upload
-    // happens in a later phase if we need binary attachments.
+    return this.sendTextMessage(ctx, message);
+  }
+
+  /**
+   * Send a plain text content message via the JSON endpoint. Returns the
+   * Chatwoot message id so the caller can dedupe.
+   */
+  private async sendTextMessage(ctx: SendContext, message: OutboundMessage): Promise<SendResult> {
+    const url = `${this.baseUrl}/api/v1/accounts/${config.CHATWOOT_ACCOUNT_ID}/conversations/${ctx.chatwootConversationId}/messages`;
     const body: Record<string, unknown> = {
       content: message.text ?? '',
       message_type: 'outgoing',
@@ -54,7 +64,7 @@ class ChatwootChannel implements ChannelAdapter {
     const res = await request(url, {
       method: 'POST',
       headers: {
-        api_access_token: config.CHATWOOT_API_TOKEN,
+        api_access_token: config.CHATWOOT_API_TOKEN!,
         'Content-Type': 'application/json',
       },
       body: JSON.stringify(body),
@@ -64,12 +74,106 @@ class ChatwootChannel implements ChannelAdapter {
     try {
       data = (await res.body.json()) as ChatwootMessageResponse;
     } catch {
-      // Some 4xx responses aren't JSON — leave data empty
+      // Some 4xx responses aren't JSON
     }
 
     if (res.statusCode >= 400) {
       const reason = `chatwoot ${res.statusCode}: ${JSON.stringify(data).slice(0, 200)}`;
-      logger.error({ statusCode: res.statusCode, data, url, waId: ctx.waId }, 'chatwoot send failed');
+      logger.error({ statusCode: res.statusCode, data, url, waId: ctx.waId }, 'chatwoot text send failed');
+      return { delivered: false, failureReason: reason, raw: data };
+    }
+
+    const externalMessageId =
+      data.source_id ?? (data.id != null ? String(data.id) : undefined);
+    return {
+      ...(externalMessageId ? { externalMessageId } : {}),
+      delivered: true,
+      raw: data,
+    };
+  }
+
+  /**
+   * Send a message with attachments. Chatwoot's API accepts:
+   *   - For URLs already hosted somewhere public (Google Drive folder IDs etc):
+   *     POST multipart/form-data with `attachment[]` set to the public URL.
+   *   - For binary uploads, include the file as form-data part.
+   *
+   * For now we support URL attachments (the v1 finca cards reference Google
+   * Drive folder URLs, which Meta WhatsApp dereferences and uploads itself
+   * once the message goes through the integration). For binary blobs (e.g.
+   * the reservation PDF generated locally) we use the `data:` URI scheme,
+   * which Chatwoot accepts and converts.
+   */
+  private async sendMediaMessage(ctx: SendContext, message: OutboundMessage): Promise<SendResult> {
+    const attachments = message.attachments ?? [];
+    if (!attachments.length) {
+      // No attachments → fall back to text-only
+      if (message.text) return this.sendTextMessage(ctx, message);
+      return { delivered: false, failureReason: 'media message has no attachments and no text' };
+    }
+
+    const url = `${this.baseUrl}/api/v1/accounts/${config.CHATWOOT_ACCOUNT_ID}/conversations/${ctx.chatwootConversationId}/messages`;
+
+    // Build a multipart form body. Chatwoot expects the parts named
+    // `content`, `message_type`, `private`, and `attachments[]`.
+    const boundary = `----depf-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+    const lines: Buffer[] = [];
+    const enc = (s: string) => Buffer.from(s, 'utf8');
+    const crlf = enc('\r\n');
+
+    const append = (fieldName: string, value: string) => {
+      lines.push(enc(`--${boundary}\r\n`));
+      lines.push(enc(`Content-Disposition: form-data; name="${fieldName}"\r\n\r\n`));
+      lines.push(enc(value));
+      lines.push(crlf);
+    };
+
+    append('content', message.text ?? '');
+    append('message_type', 'outgoing');
+    append('private', 'false');
+
+    // We can pass either a `attachments[]` field as a URL string for hosted
+    // images (Chatwoot fetches it server-side), or we can fetch it ourselves
+    // and upload as binary. Hosted URL is simpler — try that first.
+    for (const att of attachments) {
+      if (att.url) {
+        append('attachment_url[]', att.url);
+      } else if (att.data) {
+        // Decode base64 and append as a file part
+        const buffer = Buffer.from(att.data, 'base64');
+        const filename = att.filename ?? 'attachment';
+        const mimeType = att.mimeType ?? 'application/octet-stream';
+        lines.push(enc(`--${boundary}\r\n`));
+        lines.push(enc(`Content-Disposition: form-data; name="attachments[]"; filename="${filename}"\r\n`));
+        lines.push(enc(`Content-Type: ${mimeType}\r\n\r\n`));
+        lines.push(buffer);
+        lines.push(crlf);
+      }
+    }
+
+    lines.push(enc(`--${boundary}--\r\n`));
+    const body = Buffer.concat(lines);
+
+    const res = await request(url, {
+      method: 'POST',
+      headers: {
+        api_access_token: config.CHATWOOT_API_TOKEN!,
+        'Content-Type': `multipart/form-data; boundary=${boundary}`,
+        'Content-Length': String(body.length),
+      },
+      body,
+    });
+
+    let data: ChatwootMessageResponse = {};
+    try {
+      data = (await res.body.json()) as ChatwootMessageResponse;
+    } catch {
+      // ignore
+    }
+
+    if (res.statusCode >= 400) {
+      const reason = `chatwoot media ${res.statusCode}: ${JSON.stringify(data).slice(0, 200)}`;
+      logger.error({ statusCode: res.statusCode, data, url, waId: ctx.waId }, 'chatwoot media send failed');
       return { delivered: false, failureReason: reason, raw: data };
     }
 

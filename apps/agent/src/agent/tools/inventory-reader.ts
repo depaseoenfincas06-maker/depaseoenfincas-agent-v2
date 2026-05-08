@@ -43,12 +43,45 @@ export async function executeInventoryTool(
         return { ok: false, error: `invalid input: ${parsed.error.issues.map((i) => i.path.join('.')).join(', ')}` };
       }
       const matches = await matchFincas(parsed.data);
-      // Return ONLY the public view — no realName, no raw row.
+      // Return ENRICHED public view — includes the fields finca-card.ts needs
+      // to build the WhatsApp card (codigo_original, fotos, foto_url,
+      // habitaciones, observaciones_originales, etc.) but NEVER realName/
+      // owner_contacto. The LLM picks which to show and passes them back via
+      // `fincas_mostradas` in its decision; the orchestrator hands those
+      // objects to `buildPropertySequence` directly.
       return {
         ok: true,
         output: {
           matches: matches.map((m: FincaMatch) => ({
-            ...m.publicView,
+            // Stable IDs / public view
+            finca_id: m.finca.fincaId,
+            fincaId: m.finca.fincaId,
+            codigo_original: m.finca.codigo_original ?? m.finca.fincaId,
+            zona: m.finca.zona,
+            ciudad: m.finca.ciudad,
+            municipio: m.finca.ciudad,
+            capacidad_max: m.finca.capacidadMax,
+            capacidadMax: m.finca.capacidadMax,
+            capacidad_minima_tarifa: m.finca.capacidad_minima_tarifa,
+            habitaciones: m.finca.habitaciones,
+            amenidades: m.finca.amenidades,
+            mascotas: m.finca.mascotas,
+            pet_friendly: m.finca.mascotas,
+            // Pricing
+            precio_noche_base: m.finca.precio_noche_base ?? m.finca.precioPorNoche,
+            precio_fin_semana: m.finca.precio_fin_semana,
+            precio_persona_extra: m.finca.precio_persona_extra,
+            precioPorNoche: m.finca.precioPorNoche,
+            // Card content
+            descripcion_corta: m.finca.descripcionCorta,
+            descripcionCorta: m.finca.descripcionCorta,
+            observaciones_originales: m.finca.observaciones_originales,
+            caracteristicas_originales: m.finca.caracteristicas_originales,
+            especificacion_habitaciones: m.finca.especificacion_habitaciones,
+            // Media
+            foto_url: m.finca.foto_url,
+            fotos: m.finca.fotos,
+            // Match metadata for LLM reasoning
             score: m.score,
             reasons: m.reasons,
           })),

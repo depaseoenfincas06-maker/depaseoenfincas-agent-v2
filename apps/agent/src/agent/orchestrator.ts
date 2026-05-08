@@ -540,12 +540,38 @@ export class Orchestrator {
 
       // Persist BOTH the messages row (visible in dashboard) and the outbox
       // row (delivery audit). Even on failure, persist so we have a record.
+      // For media messages we store the first attachment URL + its mime type
+      // and message_type='IMAGE' / 'DOCUMENT' so the messages_text_or_media
+      // constraint is satisfied even when content is empty.
+      const firstAttachment = msg.attachments?.[0];
+      let dbMessageType = 'TEXT';
+      if (msg.type === 'image') dbMessageType = 'IMAGE';
+      else if (msg.type === 'document') dbMessageType = 'DOCUMENT';
+      else if (msg.type === 'media_group') {
+        const mime = firstAttachment?.mimeType ?? '';
+        dbMessageType = mime.startsWith('video/')
+          ? 'VIDEO'
+          : mime.startsWith('application/')
+            ? 'DOCUMENT'
+            : 'IMAGE';
+      }
+      const dbContent = msg.text && msg.text.length > 0 ? msg.text : null;
+      const dbMediaUrl = firstAttachment?.url ?? null;
+      const dbMediaMime = firstAttachment?.mimeType ?? null;
+
       await withTx(async (client) => {
         await client.query(
           `INSERT INTO messages
-             (conversation_id, external_message_id, direction, message_type, content)
-             VALUES ($1, $2, 'outbound', 'TEXT', $3)`,
-          [conversationId, sendResult.externalMessageId ?? null, msg.text ?? ''],
+             (conversation_id, external_message_id, direction, message_type, content, media_url, media_mime_type)
+             VALUES ($1, $2, 'outbound', $3, $4, $5, $6)`,
+          [
+            conversationId,
+            sendResult.externalMessageId ?? null,
+            dbMessageType,
+            dbContent,
+            dbMediaUrl,
+            dbMediaMime,
+          ],
         );
         await client.query(
           `INSERT INTO message_outbox
