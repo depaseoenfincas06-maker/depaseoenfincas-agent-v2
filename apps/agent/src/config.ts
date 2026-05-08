@@ -39,6 +39,19 @@ const envSchema = z.object({
   CHATWOOT_ACCOUNT_ID: z.coerce.number().int().positive().default(1),
   CHATWOOT_API_TOKEN: z.string().optional(),
   CHATWOOT_INBOX_ID: z.coerce.number().int().positive().optional(),
+  /**
+   * Chatwoot inbox ID for the property OWNERS' inbox. When a webhook fires
+   * with this inbox_id, the message is treated as an owner reply (parsed
+   * for sí/no availability and routed to handleOwnerInbound) instead of as
+   * a customer inbound. Optional — if unset, owner-inbox routing is off.
+   */
+  CHATWOOT_OWNER_INBOX_ID: z.coerce.number().int().positive().optional(),
+  /**
+   * HMAC secret for signing reservation-confirmation URLs. Falls back to
+   * WEBHOOK_SHARED_SECRET if unset (good enough for early dev — set a
+   * dedicated value in production).
+   */
+  PDF_HMAC_SECRET: z.string().optional(),
 
   /**
    * Client-facing WhatsApp number (the main agent). Currently +57 310 5639334.

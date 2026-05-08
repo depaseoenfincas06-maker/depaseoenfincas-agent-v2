@@ -46,6 +46,12 @@ export interface AgentSettingsView {
   ownerContactOverride?: string | null;
   inventorySheetId?: string | null;
   inventorySheetTab?: string | null;
+  // Sprint 4: WhatsApp template configuration
+  selectionNotificationRecipients?: string | null;
+  staffTemplateName?: string | null;
+  staffTemplateLanguage?: string | null;
+  ownerTemplateName?: string | null;
+  ownerTemplateLanguage?: string | null;
 }
 
 export interface StageHandler {

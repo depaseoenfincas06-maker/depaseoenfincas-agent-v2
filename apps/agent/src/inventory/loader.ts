@@ -306,6 +306,26 @@ export async function matchFincas(query: FincaQuery): Promise<FincaMatch[]> {
   return candidates.slice(0, query.limit ?? 5);
 }
 
+/**
+ * Find any finca whose owner_contacto matches the given phone number
+ * (digits-only, no '+'). Used by the owner inbox handler to identify
+ * which property an owner's reply is about. Returns the first match;
+ * if multiple fincas share an owner_contacto, that's a config issue
+ * we surface via logs.
+ */
+export async function getFincaByOwnerPhone(phone: string): Promise<Finca | null> {
+  const cleaned = phone.replace(/[^\d]/g, '');
+  if (cleaned.length < 10) return null;
+  const fincas = await loadFincas();
+  const match = fincas.find((f) => {
+    const own = (f.owner_contacto ?? '').replace(/[^\d]/g, '');
+    if (!own) return false;
+    // Match if either contains the other (handles +country prefix variations).
+    return own === cleaned || own.endsWith(cleaned) || cleaned.endsWith(own);
+  });
+  return match ?? null;
+}
+
 export async function getFincaById(fincaId: string): Promise<Finca | null> {
   const fincas = await loadFincas();
   const lower = fincaId.toLowerCase();

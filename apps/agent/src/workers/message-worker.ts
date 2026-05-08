@@ -32,6 +32,15 @@ interface InboundPayload {
   transcriptionStatus?: TranscriptionStatus;
 }
 
+/**
+ * Burst-aggregation window — any inbox rows for the same conversation that
+ * arrived within this window AND are still queued/skipped get folded into
+ * the latest message's processing pass. v1 used a similar "Is latest
+ * inbound?" check via Chatwoot API; we do it locally via the message_inbox
+ * table since that's already our source of truth.
+ */
+const BURST_WINDOW_SECONDS = 60;
+
 async function processJob(job: { id?: string; data: MessageJob }) {
   const { inboxId, conversationId } = job.data;
   const log = logger.child({ jobId: job.id, inboxId, conversationId });
@@ -39,6 +48,34 @@ async function processJob(job: { id?: string; data: MessageJob }) {
 
   const lock = await lockConversation(conversationId);
   try {
+    // Burst check: am I the LATEST queued/processing message for this
+    // conversation? If a newer one is waiting, skip — its worker will
+    // aggregate ours into its turn.
+    const peek = await pool.query<{ id: string }>(
+      `SELECT id FROM message_inbox
+        WHERE conversation_id = $1
+          AND status IN ('queued','processing')
+        ORDER BY created_at DESC LIMIT 1`,
+      [conversationId],
+    );
+    const latestPendingId = peek.rows[0]?.id;
+    if (latestPendingId && latestPendingId !== inboxId) {
+      log.info(
+        { latestPendingId },
+        'burst: a newer inbound is queued — skipping; latest worker will aggregate me',
+      );
+      await pool.query(
+        `UPDATE message_inbox
+            SET status='skipped', last_error='absorbed_into_burst', processed_at=now()
+          WHERE id=$1`,
+        [inboxId],
+      );
+      return;
+    }
+
+    // I'm the latest. Mark processing, then collect any older
+    // queued/skipped inbox rows from the same conversation that fall
+    // inside the burst window so we can fold their texts into this turn.
     const inboxRow = await pool.query<{ payload: InboundPayload }>(
       `UPDATE message_inbox
           SET status='processing', attempts = attempts + 1
@@ -48,6 +85,40 @@ async function processJob(job: { id?: string; data: MessageJob }) {
     );
     const payload = inboxRow.rows[0]?.payload;
     if (!payload) throw new Error(`inbox row missing: ${inboxId}`);
+
+    // Older messages absorbed into this burst.
+    const burstRows = await pool.query<{ id: string; payload: InboundPayload }>(
+      `SELECT id, payload FROM message_inbox
+        WHERE conversation_id = $1
+          AND id <> $2
+          AND status IN ('queued','skipped')
+          AND created_at >= now() - ($3::int * interval '1 second')
+          AND created_at < (SELECT created_at FROM message_inbox WHERE id = $2)
+        ORDER BY created_at ASC`,
+      [conversationId, inboxId, BURST_WINDOW_SECONDS],
+    );
+
+    if (burstRows.rows.length > 0) {
+      const olderTexts = burstRows.rows
+        .map((r) => (r.payload?.text ?? '').trim())
+        .filter((t) => t.length > 0);
+      const myText = (payload.text ?? '').trim();
+      const aggregated = [...olderTexts, myText].filter(Boolean).join(' ');
+      log.info(
+        { absorbed: burstRows.rows.length, aggregatedLen: aggregated.length },
+        'burst: aggregating older messages into this turn',
+      );
+      // Replace our payload's text with the aggregated string for the
+      // orchestrator. Persist into the audit table too so we can see what
+      // was merged.
+      payload.text = aggregated;
+      await pool.query(
+        `UPDATE message_inbox
+            SET status='done', last_error='absorbed_into_burst:${inboxId}', processed_at=now()
+          WHERE id = ANY($1::uuid[])`,
+        [burstRows.rows.map((r) => r.id)],
+      );
+    }
 
     // Audio handling: if the inbound has media that looks like audio AND
     // text wasn't already provided, download and transcribe it BEFORE

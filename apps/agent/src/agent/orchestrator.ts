@@ -29,6 +29,9 @@ import { logger } from '../observability/logger.js';
 import { withTx, query } from '../persistence/db.js';
 import { getChannel } from '../channels/index.js';
 import { chatwootChannel } from '../channels/chatwoot.js';
+import { sendSelectionNotifications, parseRecipients } from './selection-notifications.js';
+import { sendOwnerReservationRequest } from './owner-reservation.js';
+import { getFincaById } from '../inventory/loader.js';
 
 interface InboundEnvelope {
   channel: Channel;
@@ -64,6 +67,37 @@ export interface OrchestratorResult {
   traceId: string;
   status: 'ok' | 'silent' | 'fallback' | 'error';
   outboundCount: number;
+}
+
+/**
+ * Deterministic prechecks (v1 parity):
+ *   - owner_response.disponible === true  → jump to CONFIRMING_RESERVATION
+ *   - owner_response.disponible === false → bounce back to OFFERING (the
+ *     bot then proposes adjusting criteria / picking another finca)
+ *   - owner_response not set yet, current stage VERIFYING_AVAILABILITY →
+ *     stay in VERIFYING (let the LLM handle the wait politely)
+ *
+ * Returns null when no forcing is needed. The orchestrator applies the
+ * forced stage BEFORE running the router/QA/stage handler so the right
+ * prompt + flow runs even if the customer's text was vague.
+ */
+export function computePrecheckForcedStage(c: ConversationContext): Stage | null {
+  const owner = c.ownerResponse;
+  if (!owner || owner.disponible == null) return null;
+
+  if (owner.disponible === true) {
+    // Only force forward if we're not already in or past CONFIRMING.
+    if (c.currentStage === 'OFFERING' || c.currentStage === 'VERIFYING_AVAILABILITY') {
+      return 'CONFIRMING_RESERVATION';
+    }
+    return null;
+  }
+  // disponible === false → owner says no. Reset to OFFERING so the bot
+  // can present alternatives.
+  if (c.currentStage === 'VERIFYING_AVAILABILITY' || c.currentStage === 'CONFIRMING_RESERVATION') {
+    return 'OFFERING';
+  }
+  return null;
 }
 
 /** Business stages an auto-loop is allowed to land on. HITL is excluded —
@@ -197,12 +231,13 @@ export class Orchestrator {
 
   private async runInner(
     envelope: InboundEnvelope,
-    conversation: ConversationContext,
+    conversationArg: ConversationContext,
     settings: AgentSettingsView,
     recent: Array<{ role: 'user' | 'assistant'; content: string; createdAt: string }>,
     trace: Trace,
     log: { info: (...args: unknown[]) => void; error: (...args: unknown[]) => void; warn: (...args: unknown[]) => void },
   ): Promise<OrchestratorResult> {
+    let conversation = conversationArg;
     // Short-circuit: HITL active → silence (per-conversation)
     if (!conversation.agenteActivo) {
       await trace.finalize({
@@ -321,7 +356,20 @@ export class Orchestrator {
       return { traceId: trace.id, status: 'fallback', outboundCount: guard.outbound.length };
     }
 
-    // 2. Route — deterministic regex first, LLM classifier as fallback.
+    // 2a. Deterministic prechecks (v1 parity): if owner_response was just
+    // set since the last turn, force the appropriate stage transition
+    // BEFORE running the router/QA/stage handler. This implements
+    // "Compute deterministic prechecks" from v1.
+    const precheckForcedStage = computePrecheckForcedStage(conversation);
+    if (precheckForcedStage && precheckForcedStage !== conversation.currentStage) {
+      log.info(
+        { from: conversation.currentStage, to: precheckForcedStage, reason: 'owner_response' },
+        'precheck: forcing stage transition',
+      );
+      conversation = { ...conversation, currentStage: precheckForcedStage };
+    }
+
+    // 2b. Route — deterministic regex first, LLM classifier as fallback.
     const ruleRoute = applyDeterministicRules(userText);
     const route =
       ruleRoute ??
@@ -451,6 +499,14 @@ export class Orchestrator {
     // 5. Persist final conversation update.
     await this.persistConversationUpdate(envelope.conversationId, nextStage, extractedData);
 
+    // 6. v1 side-effects on CLIENT_CHOSE: notify staff + ping owner. Fire-
+    // and-forget — failures here log but never affect the customer turn.
+    if (intent === 'CLIENT_CHOSE') {
+      this.fireClientChoseSideEffects(envelope.conversationId, settings, extractedData).catch(
+        (err) => log.error({ err }, 'CLIENT_CHOSE side effects failed'),
+      );
+    }
+
     await trace.finalize({
       stageAfter: nextStage,
       intent,
@@ -468,6 +524,83 @@ export class Orchestrator {
   private async runStage(stage: Stage, input: StageInput) {
     const handler = getStageHandler(stage);
     return handler.handle(input);
+  }
+
+  /**
+   * v1 side-effects when a customer picks a finca:
+   *   - Send `staff_finca_selected_v1` template to each recipient in
+   *     settings.selection_notification_recipients
+   *   - Send `solicitud_reserva` template to the finca's owner_contacto
+   *     (or the override, if test mode is on)
+   *
+   * Both are best-effort. If the inventory lookup fails or templates
+   * aren't approved, we log and move on — the customer's flow is unaffected
+   * since the OFFERING handler already sent its confirmation outbound
+   * ("Voy a verificar disponibilidad...").
+   */
+  private async fireClientChoseSideEffects(
+    conversationId: string,
+    settings: AgentSettingsView,
+    extractedData: Record<string, unknown>,
+  ): Promise<void> {
+    const fincaId =
+      (extractedData.finca_elegida_id as string | undefined) ??
+      (extractedData.fincaId as string | undefined) ??
+      null;
+    if (!fincaId) {
+      logger.warn({ conversationId }, 'CLIENT_CHOSE without finca_elegida_id — skipping side effects');
+      return;
+    }
+    const finca = await getFincaById(fincaId);
+    if (!finca) {
+      logger.warn({ conversationId, fincaId }, 'CLIENT_CHOSE: finca not found in inventory');
+      return;
+    }
+
+    // Need the persisted criteria + client name for the templates.
+    const ctx = await query<{
+      client_name: string | null;
+      search_criteria: Record<string, unknown> | null;
+    }>(
+      `SELECT client_name, search_criteria FROM conversations WHERE wa_id = $1`,
+      [conversationId],
+    );
+    const clientName = ctx.rows[0]?.client_name ?? null;
+    const criteria = ctx.rows[0]?.search_criteria ?? {};
+
+    // Staff notifications (parallel — they're independent)
+    const recipients = parseRecipients(settings.selectionNotificationRecipients);
+    if (recipients.length > 0) {
+      sendSelectionNotifications({
+        clientName,
+        clientWaId: conversationId,
+        finca,
+        recipients,
+        ...(settings.staffTemplateName ? { templateName: settings.staffTemplateName } : {}),
+        ...(settings.staffTemplateLanguage ? { templateLanguage: settings.staffTemplateLanguage } : {}),
+      })
+        .then((result) =>
+          logger.info({ conversationId, fincaId, ...result }, 'staff selection notifications sent'),
+        )
+        .catch((err) => logger.error({ err, conversationId }, 'staff notifications threw'));
+    }
+
+    // Owner reservation request
+    sendOwnerReservationRequest({
+      finca,
+      clientWaId: conversationId,
+      ...(typeof criteria.fechaInicio === 'string' ? { fechaInicio: criteria.fechaInicio } : {}),
+      ...(typeof criteria.fechaFin === 'string' ? { fechaFin: criteria.fechaFin } : {}),
+      ...(typeof criteria.personas === 'number' ? { personas: criteria.personas } : {}),
+      ...(settings.ownerContactOverride ? { ownerContactOverride: settings.ownerContactOverride } : {}),
+      ...(settings.ownerTestMode ? { testMode: true } : {}),
+      ...(settings.ownerTemplateName ? { templateName: settings.ownerTemplateName } : {}),
+      ...(settings.ownerTemplateLanguage ? { templateLanguage: settings.ownerTemplateLanguage } : {}),
+    })
+      .then((result) =>
+        logger.info({ conversationId, fincaId, ...result }, 'owner reservation request sent'),
+      )
+      .catch((err) => logger.error({ err, conversationId }, 'owner reservation request threw'));
   }
 
   /**
@@ -636,6 +769,11 @@ export class Orchestrator {
       owner_contact_override: string | null;
       inventory_sheet_id: string | null;
       inventory_sheet_tab: string | null;
+      selection_notification_recipients: string | null;
+      staff_template_name: string | null;
+      staff_template_language: string | null;
+      owner_template_name: string | null;
+      owner_template_language: string | null;
     }>(`SELECT * FROM agent_settings WHERE id = 1`);
     const row = r.rows[0];
     if (!row) throw new Error('agent_settings row not found');
@@ -656,6 +794,11 @@ export class Orchestrator {
       ownerContactOverride: row.owner_contact_override,
       inventorySheetId: row.inventory_sheet_id,
       inventorySheetTab: row.inventory_sheet_tab,
+      selectionNotificationRecipients: row.selection_notification_recipients,
+      staffTemplateName: row.staff_template_name,
+      staffTemplateLanguage: row.staff_template_language,
+      ownerTemplateName: row.owner_template_name,
+      ownerTemplateLanguage: row.owner_template_language,
     };
   }
 

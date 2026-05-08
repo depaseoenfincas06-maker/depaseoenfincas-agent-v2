@@ -105,3 +105,71 @@ export async function sendOwnerMessage(toPhone: string, text: string): Promise<{
 export async function sendOwnerMediaMessage(_toPhone: string, _msg: OutboundMessage): Promise<{ ok: boolean }> {
   return { ok: false };
 }
+
+export type TemplateRole = 'client' | 'owner' | 'staff';
+
+export interface TemplateParam {
+  type: 'text' | 'currency' | 'date_time';
+  text?: string;
+  currency?: { code: string; amount_1000: number; fallback_value: string };
+  date_time?: { fallback_value: string };
+}
+
+/**
+ * Send a Meta WhatsApp template message. Templates must be pre-approved
+ * inside Meta Business Manager. We use this for:
+ *
+ *   - staff_finca_selected_v1 — fired when a customer picks a finca, sends
+ *     the team a notification with finca code + customer details.
+ *   - solicitud_reserva — fired when the bot asks an owner to confirm
+ *     availability for a reservation.
+ *
+ * The choice of phone_number_id depends on `role`:
+ *   - 'client'/'staff' → WHATSAPP_PHONE_NUMBER_ID (the customer-facing line)
+ *   - 'owner' → WHATSAPP_OWNER_PHONE_NUMBER_ID (the owner-facing line)
+ *
+ * Returns wamid so the receiver's reply can be linked back via webhook.
+ */
+export async function sendTemplateMessage(
+  role: TemplateRole,
+  toPhone: string,
+  templateName: string,
+  language: string,
+  params: TemplateParam[],
+): Promise<{ wamid?: string; ok: boolean; reason?: string }> {
+  const phoneNumberId =
+    role === 'owner'
+      ? config.WHATSAPP_OWNER_PHONE_NUMBER_ID
+      : config.WHATSAPP_PHONE_NUMBER_ID;
+  if (!phoneNumberId) {
+    return { ok: false, reason: `phone_number_id for role=${role} not configured` };
+  }
+  try {
+    const res = await metaPost(phoneNumberId, {
+      messaging_product: 'whatsapp',
+      to: toPhone,
+      type: 'template',
+      template: {
+        name: templateName,
+        language: { code: language },
+        components: params.length > 0 ? [{ type: 'body', parameters: params }] : [],
+      },
+    });
+    let data: MetaSendResponse = {};
+    try {
+      data = (await res.body.json()) as MetaSendResponse;
+    } catch {
+      /* ignore */
+    }
+    if (res.statusCode >= 400) {
+      const reason = `meta ${res.statusCode}: ${JSON.stringify(data).slice(0, 200)}`;
+      logger.error({ statusCode: res.statusCode, data, role, templateName }, 'template send failed');
+      return { ok: false, reason };
+    }
+    return { wamid: data.messages?.[0]?.id, ok: true };
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    logger.error({ err, role, templateName }, 'template send error');
+    return { ok: false, reason };
+  }
+}

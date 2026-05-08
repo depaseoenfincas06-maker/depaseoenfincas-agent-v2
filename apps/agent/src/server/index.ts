@@ -8,6 +8,7 @@ import { pool } from '../persistence/db.js';
 import { webhookRoutes } from './routes/webhook.js';
 import { chatwootWebhookRoutes } from './routes/chatwoot-webhook.js';
 import { adminRoutes } from './routes/admin.js';
+import { reservationPdfRoutes } from './routes/reservation-pdf.js';
 
 async function buildServer() {
   const app = Fastify({ loggerInstance: logger, disableRequestLogging: false });
@@ -49,6 +50,9 @@ async function buildServer() {
   await app.register(webhookRoutes, { prefix: '/webhook' });
   await app.register(chatwootWebhookRoutes, { prefix: '/webhook' });
   await app.register(adminRoutes, { prefix: '/api' });
+  // Public, HMAC-signed reservation confirmation page. Mounted at /api so
+  // the existing CORS / route hierarchy handles it.
+  await app.register(reservationPdfRoutes, { prefix: '/api' });
 
   return app;
 }

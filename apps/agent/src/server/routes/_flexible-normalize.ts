@@ -24,6 +24,7 @@ export interface FlexibleResult {
   externalMessageId: string | undefined;
   chatwootMessageId: string | undefined;
   chatwootConversationId: number | undefined;
+  inboxId: number | undefined;
   clientName: string | undefined;
   media:
     | {
@@ -273,6 +274,7 @@ export function flexibleNormalize(payload: unknown): FlexibleResult | FlexibleSk
   const { wamid, chatwootMessageId } = findWamid(payload);
   const clientName = findClientName(payload);
   const chatwootConversationId = findConversationId(payload);
+  const inboxId = findInboxId(payload);
   const media = findMedia(payload);
 
   return {
@@ -281,7 +283,30 @@ export function flexibleNormalize(payload: unknown): FlexibleResult | FlexibleSk
     externalMessageId: wamid ?? chatwootMessageId,
     chatwootMessageId,
     chatwootConversationId,
+    inboxId,
     clientName,
     media,
   };
+}
+
+/** Walk the payload looking for an inbox_id at any depth. */
+function findInboxId(payload: unknown): number | undefined {
+  let found: number | undefined;
+  function walk(v: unknown) {
+    if (!v || typeof v !== 'object' || found != null) return;
+    for (const [k, val] of Object.entries(v as Record<string, unknown>)) {
+      if (found != null) return;
+      if (k === 'inbox_id' || k === 'inboxId') {
+        const n = Number(val);
+        if (Number.isFinite(n) && n > 0) {
+          found = n;
+          return;
+        }
+      } else if (val && typeof val === 'object') {
+        walk(val);
+      }
+    }
+  }
+  walk(payload);
+  return found;
 }

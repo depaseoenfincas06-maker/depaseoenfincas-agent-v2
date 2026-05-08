@@ -20,6 +20,7 @@ import { pool } from '../../persistence/db.js';
 import { enqueueMessageJob } from '../../queue/index.js';
 import { config } from '../../config.js';
 import { flexibleNormalize } from './_flexible-normalize.js';
+import { handleOwnerInbound } from '../../agent/owner-inbox.js';
 
 // Tolerant schema — Chatwoot evolves its payload; we want to accept what we
 // recognize and ignore the rest, never reject a well-formed message.
@@ -116,6 +117,7 @@ interface NormalizedInbound {
   externalMessageId: string | undefined; // wamid if available, else chatwoot id
   chatwootMessageId: string | undefined;
   chatwootConversationId: number | undefined;
+  inboxId: number | undefined; // for owner-inbox routing
   clientName: string | undefined;
   text: string | undefined;
   media:
@@ -215,12 +217,20 @@ function normalize(payload: ChatwootPayload): NormalizedInbound | { skip: true; 
   const clientName = payload.conversation?.meta?.sender?.name ?? payload.sender?.name ?? undefined;
   const media = pickMedia(msg?.attachments) ?? pickMedia(payload.attachments);
 
+  const inboxId =
+    payload.conversation?.inbox_id != null
+      ? Number(payload.conversation.inbox_id)
+      : payload.conversation?.contact_inbox?.inbox_id != null
+        ? Number(payload.conversation.contact_inbox.inbox_id)
+        : undefined;
+
   return {
     channel: 'chatwoot',
     conversationId: waId,
     externalMessageId: wamid ?? chatwootMessageId,
     chatwootMessageId,
     chatwootConversationId: conversationId,
+    inboxId,
     clientName,
     text: content ?? undefined,
     media,
@@ -477,10 +487,38 @@ export async function chatwootWebhookRoutes(app: FastifyInstance) {
         externalMessageId: flex.externalMessageId,
         chatwootMessageId: flex.chatwootMessageId,
         chatwootConversationId: flex.chatwootConversationId,
+        inboxId: flex.inboxId,
         clientName: flex.clientName,
         text: flex.text ?? undefined,
         media: flex.media,
       };
+    }
+
+    // Owner-inbox routing: if the configured CHATWOOT_OWNER_INBOX_ID matches
+    // this message's inbox, treat it as an owner reply (sí/no availability)
+    // instead of a customer inbound. We DO NOT enqueue a normal message job
+    // — the orchestrator never sees the owner's text. We just persist the
+    // owner_response on the matched client conversation.
+    if (
+      config.CHATWOOT_OWNER_INBOX_ID != null &&
+      normalized.inboxId === config.CHATWOOT_OWNER_INBOX_ID
+    ) {
+      try {
+        const ownerResult = await handleOwnerInbound(
+          normalized.conversationId,
+          normalized.text,
+        );
+        req.log.info(
+          { ownerResult, inboxId: normalized.inboxId },
+          'owner-inbox webhook routed',
+        );
+        await logDebugHit(req, auth.reason, 'owner_inbox', auth.signatureRaw, auth.computedHmac);
+        return reply.send({ ok: true, ownerInbox: true, ...ownerResult });
+      } catch (err) {
+        req.log.error({ err }, 'owner inbound handler threw');
+        await logDebugHit(req, auth.reason, 'owner_inbox_error', auth.signatureRaw, auth.computedHmac);
+        return reply.send({ ok: false, error: err instanceof Error ? err.message : String(err) });
+      }
     }
 
     // Idempotency: if we already have a message with this external_message_id,
