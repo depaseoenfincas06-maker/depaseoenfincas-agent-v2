@@ -17,6 +17,8 @@ import { buildToneBlock, withStageAddendum } from './types.js';
 import { getLLM } from '../llm/index.js';
 import { executeInventoryTool, INVENTORY_TOOL_DESCRIPTIONS } from '../tools/inventory-reader.js';
 import { buildPropertySequence, type FincaForCard, type OutboundItem } from '../finca-card.js';
+import { getFincaById } from '../../inventory/loader.js';
+import type { Finca } from '../../inventory/types.js';
 
 const MAX_TOOL_ITERATIONS = 3;
 
@@ -37,14 +39,14 @@ CÓMO PRESENTAR FINCAS — REGLA INVIOLABLE:
     outbound_text: un PREÁMBULO breve (≤ 35 palabras) en español, conversacional. Ejemplos:
         - Caso normal: "¡Genial! Encontré estas opciones para ti, mira a ver cuál te late más:"
         - Caso similar_items (no hay match estricto): "En esa zona no tengo opciones disponibles, pero te muestro estas alternativas cercanas que pueden funcionarte:"
-    fincas_mostradas: ARRAY con los OBJETOS COMPLETOS, VERBATIM, tal como vienen del tool. Cópialos enteros sin omitir ningún campo. NO los resumas, NO los reescribas, NO inventes campos.
+    fincas_mostradas: ARRAY con SOLO los finca_id (strings) de las fincas que decidiste mostrar, en el orden que quieres mostrarlas. Ejemplo: ["F009","F003","F005"]. Hasta {MAX_PROPERTIES} ids. NO objetos completos, NO descripciones, SOLO ids.
     done: true
 
-- El sistema construye AUTOMÁTICAMENTE las fichas con su formato (☀️🌴*PEREIRA #09*🌴☀️ + amenidades + tarifa) y luego envía las fotos. Para que esto pase tú DEBES pasar las fincas en fincas_mostradas.
+- El sistema construye AUTOMÁTICAMENTE las fichas con su formato (☀️🌴*PEREIRA #09*🌴☀️ + amenidades + tarifa) buscando cada finca_id en el inventario y luego envía las fotos. Tu única responsabilidad es decidir CUÁLES IDs mostrar y en qué orden.
 
-- PROHIBIDO: escribir las fichas como texto en outbound_text. Si lo haces, el cliente no verá las fotos y la ficha tendrá descripciones inventadas. SIEMPRE pasa los objetos en fincas_mostradas.
+- PROHIBIDO: escribir las fichas como texto en outbound_text. Si lo haces, el cliente no verá las fotos y la ficha tendrá descripciones inventadas. SIEMPRE pasa los IDs en fincas_mostradas.
 
-- Si list_matching_fincas devolvió matches=[] y similar_items=[…X items], usa los similar_items en fincas_mostradas y avisa en el preámbulo.
+- Si list_matching_fincas devolvió matches=[] y similar_items=[…X items], pon los IDs de similar_items en fincas_mostradas y avisa en el preámbulo.
 
 - Si AMBOS están vacíos: intent="NO_MATCH", outbound_text="No encontré opciones que cumplan esos criterios. ¿Quieres ajustar algo (fechas, presupuesto, zona)?", fincas_mostradas=[].
 
@@ -119,6 +121,7 @@ class OfferingStage implements StageHandler {
         messages,
         schema: stageDecisionSchema,
         temperature: 0.3,
+        maxTokens: 4096,
       });
 
       await input.trace.recordTurn({
@@ -158,7 +161,7 @@ class OfferingStage implements StageHandler {
         { role: 'assistant', content: JSON.stringify({ tool_calls: data.tool_calls, done: false }) },
         {
           role: 'user',
-          content: `[Resultados de tools]\n${JSON.stringify(toolResults, null, 0)}\n\nAhora produce tu JSON FINAL con done=true. Si vas a mostrar fincas: intent=SHOW_OPTIONS + outbound_text con preámbulo breve + fincas_mostradas con los objetos VERBATIM del listado (hasta ${maxProps}).`,
+          content: `[Resultados de tools]\n${JSON.stringify(toolResults, null, 0)}\n\nAhora produce tu JSON FINAL con done=true. Si vas a mostrar fincas: intent=SHOW_OPTIONS + outbound_text con preámbulo breve + fincas_mostradas como array de finca_id (strings, hasta ${maxProps}). El sistema construye las fichas; tú solo eliges qué IDs mostrar.`,
         },
       );
     }
@@ -172,11 +175,12 @@ class OfferingStage implements StageHandler {
           {
             role: 'user',
             content:
-              'Ya consultaste suficientes tools. Devuelve un JSON FINAL con done=true. Si tienes fincas para mostrar, intent=SHOW_OPTIONS + outbound_text con preámbulo + fincas_mostradas. NO más tool_calls.',
+              'Ya consultaste suficientes tools. Devuelve un JSON FINAL con done=true. Si tienes fincas para mostrar, intent=SHOW_OPTIONS + outbound_text con preámbulo + fincas_mostradas como array de finca_id strings. NO más tool_calls.',
           },
         ],
         schema: stageDecisionSchema,
         temperature: 0.2,
+        maxTokens: 4096,
       });
       await input.trace.recordTurn({
         stage: 'OFFERING',
@@ -193,7 +197,7 @@ class OfferingStage implements StageHandler {
       finalData = final.data;
     }
 
-    const outbound = this.buildOutbound(finalData);
+    const outbound = await this.buildOutbound(finalData);
 
     return {
       intent: finalData.intent,
@@ -209,28 +213,92 @@ class OfferingStage implements StageHandler {
    * Convert the LLM's decision into the v1-style outbound sequence:
    *   [preamble_text, card_1, media_1, card_2, media_2, ...]
    *
-   * If `fincas_mostradas` is populated and intent='SHOW_OPTIONS', we build
-   * cards + media via buildPropertySequence. Otherwise just a single text
-   * message with outbound_text (or [] if neither).
+   * The LLM passes `fincas_mostradas` as either an array of finca_id strings
+   * (preferred — keeps the JSON small enough to never truncate) or as full
+   * objects (legacy / fallback). Either way we resolve each entry to the
+   * canonical Finca from the inventory and build the card via
+   * `buildPropertySequence` so the formatting (codigo_original, emojis,
+   * tarifa, photos) is always our code, never the LLM's paraphrase.
    */
-  private buildOutbound(data: import('@depf/shared').StageDecisionRaw): OutboundMessage[] {
+  private async buildOutbound(
+    data: import('@depf/shared').StageDecisionRaw,
+  ): Promise<OutboundMessage[]> {
     const out: OutboundMessage[] = [];
 
-    // Always lead with the preamble (LLM's outbound_text). Empty string is
-    // skipped — that's how the LLM signals "no extra text, just the cards".
     if (data.outbound_text && data.outbound_text.trim().length > 0) {
       out.push({ channel: 'simulator', type: 'text', text: data.outbound_text.trim() });
     }
 
-    const fincas = (data.fincas_mostradas ?? []) as FincaForCard[];
-    if (fincas.length > 0) {
-      const sequence = buildPropertySequence(fincas);
+    const raw = data.fincas_mostradas ?? [];
+    const cards: FincaForCard[] = [];
+    for (const entry of raw as unknown[]) {
+      // Case A: bare string ID
+      if (typeof entry === 'string' && entry.trim().length > 0) {
+        const finca = await getFincaById(entry.trim());
+        if (finca) cards.push(this.fincaToCard(finca));
+        continue;
+      }
+      // Case B: object — could be a full FincaForCard already, or an
+      // {finca_id} stub. Try to look up canonical first; fall back to the
+      // object as-is.
+      if (entry && typeof entry === 'object') {
+        const obj = entry as Record<string, unknown>;
+        const id = String(obj.finca_id ?? obj.fincaId ?? '');
+        if (id) {
+          const finca = await getFincaById(id);
+          if (finca) {
+            cards.push(this.fincaToCard(finca));
+            continue;
+          }
+        }
+        // No id match — best-effort with whatever the LLM provided.
+        cards.push(obj as FincaForCard);
+      }
+    }
+
+    if (cards.length > 0) {
+      const sequence = buildPropertySequence(cards);
       for (const item of sequence) {
         out.push(this.toOutboundMessage(item));
       }
     }
 
     return out;
+  }
+
+  /** Map a canonical Finca (from the inventory) to the FincaForCard shape
+   *  buildFincaCard expects. */
+  private fincaToCard(f: Finca): FincaForCard {
+    return {
+      finca_id: f.fincaId,
+      fincaId: f.fincaId,
+      ...(f.realName ? { realName: f.realName } : {}),
+      ...(f.codigo_original ? { codigo_original: f.codigo_original } : {}),
+      zona: f.zona,
+      ...(f.ciudad ? { ciudad: f.ciudad, municipio: f.ciudad } : {}),
+      ...(f.habitaciones != null ? { habitaciones: f.habitaciones } : {}),
+      ...(f.capacidadMax != null
+        ? { capacidad_max: f.capacidadMax, capacidadMax: f.capacidadMax }
+        : {}),
+      amenidades: f.amenidades ?? [],
+      ...(f.descripcionCorta
+        ? { descripcion_corta: f.descripcionCorta, descripcionCorta: f.descripcionCorta }
+        : {}),
+      ...(f.observaciones_originales
+        ? { observaciones_originales: f.observaciones_originales }
+        : {}),
+      ...(f.caracteristicas_originales
+        ? { caracteristicas_originales: f.caracteristicas_originales }
+        : {}),
+      ...(f.especificacion_habitaciones
+        ? { especificacion_habitaciones: f.especificacion_habitaciones }
+        : {}),
+      ...(f.precio_noche_base != null ? { precio_noche_base: f.precio_noche_base } : {}),
+      ...(f.precio_fin_semana != null ? { precio_fin_semana: f.precio_fin_semana } : {}),
+      ...(f.precioPorNoche != null ? { precioPorNoche: f.precioPorNoche } : {}),
+      ...(f.foto_url ? { foto_url: f.foto_url } : {}),
+      fotos: f.fotos ?? [],
+    };
   }
 
   private toOutboundMessage(item: OutboundItem): OutboundMessage {

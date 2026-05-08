@@ -48,6 +48,19 @@ export function applyDeterministicRules(text: string): RouteDecision | null {
   const t = text.trim();
   if (!t) return null;
 
+  // Very short affirmations / negations / confirmations skip the LLM router
+  // entirely — they're always continuations of the current stage flow.
+  // Sending "si dale" through the QA classifier was producing malformed
+  // JSON (token-truncated) which then fell through to fallback.
+  if (
+    /^(si|s[ií]+|nop?e?|ok|okay|listo|dale|dame|claro|por\s+supuesto|de\s+una|vale|perfecto|bueno|hecho)\b/i.test(
+      t,
+    ) &&
+    t.length < 30
+  ) {
+    return { destination: 'stage', reason: 'short affirmation/confirmation', confidence: 'rule' };
+  }
+
   for (const re of HITL_PATTERNS) {
     if (re.test(t)) {
       return { destination: 'hitl', reason: 'HITL pattern matched', confidence: 'rule' };
