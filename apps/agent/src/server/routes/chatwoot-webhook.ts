@@ -281,15 +281,33 @@ function verifyAuth(req: FastifyRequest): AuthResult {
     };
   }
 
-  const computed = createHmac('sha256', config.WEBHOOK_SHARED_SECRET).update(raw).digest('hex');
+  /**
+   * Chatwoot signs `${timestamp}.${body}` — verified against
+   * lib/webhooks/trigger.rb in chatwoot/chatwoot:
+   *   "sha256=#{OpenSSL::HMAC.hexdigest('SHA256', secret, "#{ts}.#{body}")}"
+   * Without the ts. prefix, every real delivery's signature mismatches
+   * (we wasted hours on this — leaving the comment as a reminder).
+   * Fall back to body-only HMAC for backward compat with older versions.
+   */
+  const ts = String(req.headers['x-chatwoot-timestamp'] ?? '').trim();
+  const computed = createHmac('sha256', config.WEBHOOK_SHARED_SECRET)
+    .update(ts ? `${ts}.${raw}` : raw)
+    .digest('hex');
   const a = Buffer.from(hex, 'hex');
   const b = Buffer.from(computed, 'hex');
   if (a.length === b.length && timingSafeEqual(a, b)) {
     return { ok: true, reason: 'HMAC matched', signatureRaw: sigStr, computedHmac: computed };
   }
+  // Fallback: try body-only (older Chatwoot variants or non-Chatwoot senders)
+  const computedBodyOnly = createHmac('sha256', config.WEBHOOK_SHARED_SECRET).update(raw).digest('hex');
+  const aFallback = Buffer.from(hex, 'hex');
+  const bFallback = Buffer.from(computedBodyOnly, 'hex');
+  if (aFallback.length === bFallback.length && timingSafeEqual(aFallback, bFallback)) {
+    return { ok: true, reason: 'HMAC matched (body-only fallback)', signatureRaw: sigStr, computedHmac: computedBodyOnly };
+  }
   return {
     ok: false,
-    reason: `HMAC mismatch: expected=${hex.slice(0, 12)} computed=${computed.slice(0, 12)} bodyLen=${raw.length}`,
+    reason: `HMAC mismatch: expected=${hex.slice(0, 12)} computed_ts.body=${computed.slice(0, 12)} computed_body=${computedBodyOnly.slice(0, 12)} bodyLen=${raw.length} ts=${ts.slice(0, 14)}`,
     signatureRaw: sigStr,
     computedHmac: computed,
   };
