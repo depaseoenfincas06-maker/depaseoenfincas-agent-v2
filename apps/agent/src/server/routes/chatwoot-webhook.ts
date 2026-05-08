@@ -12,7 +12,9 @@
  * (chatwoot_message_id) — if a row with the same external_message_id already
  * exists in messages, we skip.
  */
-import type { FastifyInstance } from 'fastify';
+import type { FastifyInstance, FastifyRequest } from 'fastify';
+import { createHmac, timingSafeEqual } from 'node:crypto';
+import { Buffer } from 'node:buffer';
 import { z } from 'zod';
 import { pool } from '../../persistence/db.js';
 import { enqueueMessageJob } from '../../queue/index.js';
@@ -230,15 +232,64 @@ function normalize(payload: ChatwootPayload): NormalizedInbound | { skip: true; 
 export const __test_normalize = normalize;
 export const __test_schema = chatwootMessagePayloadSchema;
 
+/**
+ * Auth check for the Chatwoot webhook. Chatwoot does NOT send the secret
+ * literally as a header — it signs each payload with HMAC-SHA256 using the
+ * configured Secret and sends the result in `x-chatwoot-signature: sha256=…`.
+ * We accept three modes:
+ *
+ *   1. HMAC verification (real Chatwoot deliveries):
+ *      computed = HMAC-SHA256(WEBHOOK_SHARED_SECRET, raw_body)
+ *      compare to x-chatwoot-signature, constant-time
+ *
+ *   2. Literal `x-webhook-secret` header (manual curl tests, simulators,
+ *      legacy callers). Convenient for ops debugging.
+ *
+ *   3. If WEBHOOK_SHARED_SECRET is unset, accept any caller (open mode —
+ *      relies on URL secrecy alone). Useful for early dev / smoke tests.
+ *
+ * Originally we ONLY checked mode 2, which silently 401'd every real
+ * Chatwoot delivery and led to Chatwoot disabling the webhook entirely.
+ */
+function verifyAuth(req: FastifyRequest): { ok: true } | { ok: false; reason: string } {
+  if (!config.WEBHOOK_SHARED_SECRET) return { ok: true };
+
+  const literal = req.headers['x-webhook-secret'];
+  if (typeof literal === 'string' && literal === config.WEBHOOK_SHARED_SECRET) {
+    return { ok: true };
+  }
+
+  const sig = req.headers['x-chatwoot-signature'];
+  const sigStr = Array.isArray(sig) ? sig[0] : sig;
+  if (typeof sigStr === 'string') {
+    const m = sigStr.match(/^sha256=([a-f0-9]+)$/i);
+    if (m) {
+      const raw = (req as unknown as { rawBody?: string }).rawBody;
+      if (typeof raw === 'string' && raw.length > 0) {
+        const computed = createHmac('sha256', config.WEBHOOK_SHARED_SECRET).update(raw).digest('hex');
+        const a = Buffer.from(m[1]!.toLowerCase(), 'hex');
+        const b = Buffer.from(computed.toLowerCase(), 'hex');
+        if (a.length === b.length && timingSafeEqual(a, b)) {
+          return { ok: true };
+        }
+        return { ok: false, reason: 'x-chatwoot-signature HMAC mismatch' };
+      }
+      return { ok: false, reason: 'cannot verify HMAC: rawBody not captured' };
+    }
+  }
+
+  return {
+    ok: false,
+    reason: 'no valid auth: x-webhook-secret literal mismatch and x-chatwoot-signature missing/invalid',
+  };
+}
+
 export async function chatwootWebhookRoutes(app: FastifyInstance) {
   app.post('/chatwoot', async (req, reply) => {
-    // Optional shared-secret check for Chatwoot. Configure via WEBHOOK_SHARED_SECRET
-    // and set the same value as the Chatwoot webhook header.
-    if (config.WEBHOOK_SHARED_SECRET) {
-      const got = req.headers['x-webhook-secret'];
-      if (got !== config.WEBHOOK_SHARED_SECRET) {
-        return reply.unauthorized('invalid webhook secret');
-      }
+    const auth = verifyAuth(req);
+    if (!auth.ok) {
+      req.log.warn({ reason: auth.reason }, 'chatwoot webhook auth failed');
+      return reply.unauthorized(auth.reason);
     }
 
     const parsed = chatwootMessagePayloadSchema.safeParse(req.body);

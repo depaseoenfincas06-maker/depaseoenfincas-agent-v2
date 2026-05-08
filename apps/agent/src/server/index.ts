@@ -16,6 +16,28 @@ async function buildServer() {
   await app.register(cors, { origin: true });
   await app.register(multipart, { limits: { fileSize: 50 * 1024 * 1024 } }); // 50MB max for audio uploads
 
+  /**
+   * Capture the raw request body for application/json POSTs so that
+   * HMAC verification (Chatwoot's x-chatwoot-signature header) can hash
+   * the EXACT bytes Chatwoot sent. Without this, a re-stringified
+   * payload would produce a different HMAC and signature checks would
+   * always fail. Other routes can ignore req.rawBody.
+   */
+  app.addContentTypeParser(
+    'application/json',
+    { parseAs: 'string' },
+    (req, body, done) => {
+      try {
+        const rawBody = body as string;
+        (req as unknown as { rawBody: string }).rawBody = rawBody;
+        const json = rawBody.length > 0 ? JSON.parse(rawBody) : {};
+        done(null, json);
+      } catch (err) {
+        done(err as Error, undefined);
+      }
+    },
+  );
+
   app.get('/health', async () => {
     const dbOk = await pool
       .query('SELECT 1')
