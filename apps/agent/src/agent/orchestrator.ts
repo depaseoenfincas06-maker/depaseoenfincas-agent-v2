@@ -460,18 +460,21 @@ export class Orchestrator {
         break;
       }
 
-      // Decide whether to auto-loop for another hop.
+      // Decide whether to auto-loop for another hop. v1 parity: an EXPLICIT
+      // stage transition (LLM set next_stage to a different business state)
+      // is the signal to keep going in the same turn — even if the prior
+      // hop produced a "dame un momentico" placeholder. The placeholder +
+      // the new stage's outbound get delivered together at the end so the
+      // customer sees both: the acknowledgement AND the cards.
+      //
+      // Without this, the original "te busco las opciones" → no fincas bug
+      // re-appears: QUALIFYING produces a holding message, sets
+      // next_stage=OFFERING, and we'd ship the holding message without
+      // ever actually running OFFERING.
       const stageChanged = nextStage !== runningConversation.currentStage;
       const isBusinessTransition = AUTO_LOOP_STAGES.has(nextStage);
-      const producedOutbound = outbound.length > 0;
-      // v1 rule: only auto-loop when the LLM signals we should, by emitting
-      // a stage change AND not producing customer-facing outbound (or only
-      // producing the silent "ok let me look that up" preamble). When the
-      // stage handler ALREADY produced outbound, we should ship it — the
-      // user is waiting. When it produced nothing AND moved the state,
-      // that's the signal to re-run on the new stage in the same turn.
       const shouldLoop =
-        stageChanged && isBusinessTransition && !producedOutbound && hop + 1 < MAX_AUTO_LOOP_HOPS;
+        stageChanged && isBusinessTransition && hop + 1 < MAX_AUTO_LOOP_HOPS;
       if (!shouldLoop) break;
 
       log.info(
