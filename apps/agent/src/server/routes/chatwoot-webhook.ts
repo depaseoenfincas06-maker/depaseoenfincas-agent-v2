@@ -521,6 +521,33 @@ export async function chatwootWebhookRoutes(app: FastifyInstance) {
       }
     }
 
+    // Inbox allowlist: only respond on the customer inbox. v1 parity.
+    // Anyone messaging the owner WhatsApp number (+1) — whether it's a
+    // wrong number, a propietario without an open reservation request, or
+    // the owner inbox without OWNER_INBOX_ID configured — gets silence.
+    // We ack the webhook so Chatwoot doesn't retry, but we don't enqueue
+    // a job and the bot stays quiet.
+    if (
+      config.CHATWOOT_INBOX_ID != null &&
+      normalized.inboxId != null &&
+      normalized.inboxId !== config.CHATWOOT_INBOX_ID
+    ) {
+      req.log.info(
+        {
+          messageInboxId: normalized.inboxId,
+          allowedInboxId: config.CHATWOOT_INBOX_ID,
+          ownerInboxId: config.CHATWOOT_OWNER_INBOX_ID,
+        },
+        'inbox not in allowlist — ignoring (only respond on customer inbox)',
+      );
+      await logDebugHit(req, auth.reason, 'inbox_ignored', auth.signatureRaw, auth.computedHmac);
+      return reply.send({
+        ok: true,
+        ignored: true,
+        reason: `inbox ${normalized.inboxId} is not the customer inbox ${config.CHATWOOT_INBOX_ID}`,
+      });
+    }
+
     // Idempotency: if we already have a message with this external_message_id,
     // skip (Chatwoot retried).
     if (normalized.externalMessageId) {
