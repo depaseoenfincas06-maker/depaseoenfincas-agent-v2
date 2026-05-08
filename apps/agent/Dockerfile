@@ -18,6 +18,10 @@ COPY packages/shared ./packages/shared
 COPY apps/agent ./apps/agent
 
 RUN pnpm install --frozen-lockfile --offline
+# Build shared FIRST so its dist/ exists when the agent's tsc resolves
+# '@depf/shared' via package.json main. Without this, the agent's
+# compiled output references a TS source file Node 20 can't load.
+RUN pnpm --filter @depf/shared build
 RUN pnpm --filter @depf/agent build
 
 # ---- Runtime stage -------------------------------------------------------
