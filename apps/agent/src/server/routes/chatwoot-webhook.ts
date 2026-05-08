@@ -32,35 +32,80 @@ const chatwootAttachmentSchema = z.object({
   file_size: z.number().optional(),
 }).passthrough();
 
-const chatwootMessagePayloadSchema = z.object({
-  event: z.string().optional(),
-  id: z.union([z.number(), z.string()]).optional(),
-  content: z.string().nullable().optional(),
-  message_type: z.union([z.number(), z.string()]).optional(),
-  content_type: z.string().optional(),
-  source_id: z.string().nullable().optional(),
-  private: z.boolean().optional(),
-  sender: chatwootSenderSchema.optional(),
-  conversation: z
-    .object({
-      id: z.union([z.number(), z.string()]).optional(),
-      contact_inbox: z
-        .object({
-          source_id: z.string().nullable().optional(),
-        })
-        .passthrough()
-        .optional(),
-      meta: z
-        .object({
-          sender: chatwootSenderSchema.optional(),
-        })
-        .passthrough()
-        .optional(),
-    })
-    .passthrough()
-    .optional(),
-  attachments: z.array(chatwootAttachmentSchema).optional(),
-}).passthrough();
+/**
+ * A single message inside the conversation.messages[] array. This is where
+ * Chatwoot puts the per-message metadata (message_type, source_id=wamid,
+ * sender_type, private, attachments) — NOT at the top level. That mismatch
+ * is what made our earlier normalizer skip every real event.
+ */
+const chatwootMessageSchema = z
+  .object({
+    id: z.union([z.number(), z.string()]).optional(),
+    content: z.string().nullable().optional(),
+    content_type: z.string().optional(),
+    message_type: z.union([z.number(), z.string()]).optional(),
+    source_id: z.string().nullable().optional(),
+    private: z.boolean().optional(),
+    sender_type: z.string().optional(), // "Contact" = client, "User" = agent
+    created_at: z.union([z.number(), z.string()]).optional(),
+    attachments: z.array(chatwootAttachmentSchema).optional(),
+  })
+  .passthrough();
+
+/**
+ * Verified against a real Chatwoot payload captured via webhook.site:
+ * top-level keys are { account, content, content_type, conversation }; the
+ * per-message info lives inside conversation.messages[] and the wa_id comes
+ * from conversation.contact_inbox.source_id (the WhatsApp phone number).
+ */
+const chatwootMessagePayloadSchema = z
+  .object({
+    // Real Chatwoot shape
+    account: z
+      .object({ id: z.union([z.number(), z.string()]).optional(), name: z.string().optional() })
+      .passthrough()
+      .optional(),
+    content: z.string().nullable().optional(),
+    content_type: z.string().optional(),
+    conversation: z
+      .object({
+        id: z.union([z.number(), z.string()]).optional(),
+        inbox_id: z.union([z.number(), z.string()]).optional(),
+        channel: z.string().optional(),
+        can_reply: z.boolean().optional(),
+        contact_inbox: z
+          .object({
+            source_id: z.string().nullable().optional(),
+            inbox_id: z.union([z.number(), z.string()]).optional(),
+          })
+          .passthrough()
+          .optional(),
+        meta: z
+          .object({
+            sender: chatwootSenderSchema.optional(),
+            assignee: z.unknown().optional(),
+          })
+          .passthrough()
+          .optional(),
+        messages: z.array(chatwootMessageSchema).optional(),
+      })
+      .passthrough()
+      .optional(),
+
+    // Legacy / alternative shape (some Chatwoot versions put fields at top level)
+    event: z.string().optional(),
+    id: z.union([z.number(), z.string()]).optional(),
+    message_type: z.union([z.number(), z.string()]).optional(),
+    source_id: z.string().nullable().optional(),
+    private: z.boolean().optional(),
+    sender: chatwootSenderSchema.optional(),
+    sender_type: z.string().optional(),
+    attachments: z.array(chatwootAttachmentSchema).optional(),
+  })
+  .passthrough();
+
+type ChatwootPayload = z.infer<typeof chatwootMessagePayloadSchema>;
+type ChatwootMessage = z.infer<typeof chatwootMessageSchema>;
 
 interface NormalizedInbound {
   channel: 'chatwoot';
@@ -79,33 +124,55 @@ interface NormalizedInbound {
     | undefined;
 }
 
-function isIncomingMessage(payload: z.infer<typeof chatwootMessagePayloadSchema>): boolean {
-  // Chatwoot uses 0 for incoming, 1 for outgoing. Some payloads stringify it.
-  if (payload.event && payload.event !== 'message_created') return false;
-  if (payload.private === true) return false;
-  const mt = payload.message_type;
-  if (mt === 0 || mt === '0' || mt === 'incoming') return true;
-  return false;
+function isIncoming(m: { message_type?: number | string; private?: boolean; sender_type?: string }): boolean {
+  if (m.private === true) return false;
+  if (m.sender_type && m.sender_type !== 'Contact') return false; // agent reply, skip
+  const mt = m.message_type;
+  return mt === 0 || mt === '0' || mt === 'incoming';
 }
 
-function pickWaId(payload: z.infer<typeof chatwootMessagePayloadSchema>): string | null {
-  const sender = payload.sender ?? payload.conversation?.meta?.sender;
-  // Prefer identifier (Meta WhatsApp uses it as wa_id, e.g. "573001234567")
+/**
+ * Pick the message that triggered this webhook from conversation.messages[].
+ * Chatwoot includes the full conversation history; the firing message is
+ * typically the last one whose content matches the top-level `content`. If
+ * no match by content, fall back to the most recent inbound message.
+ */
+function pickTriggeringMessage(payload: ChatwootPayload): ChatwootMessage | undefined {
+  const messages = payload.conversation?.messages ?? [];
+  const topContent = payload.content;
+  // Try by content match first (most reliable)
+  if (topContent != null) {
+    const match = [...messages].reverse().find((m) => m.content === topContent && isIncoming(m));
+    if (match) return match;
+  }
+  // Fallback: most recent inbound
+  return [...messages].reverse().find(isIncoming);
+}
+
+function pickWaId(payload: ChatwootPayload): string | null {
+  // 1. conversation.contact_inbox.source_id (phone number, no '+', e.g. "573001234567")
+  const ciSource = payload.conversation?.contact_inbox?.source_id;
+  if (ciSource && /^\d+$/.test(ciSource)) return ciSource;
+  // 2. conversation.meta.sender.identifier
+  const metaSender = payload.conversation?.meta?.sender;
+  if (metaSender?.identifier && /^\d+$/.test(metaSender.identifier)) return metaSender.identifier;
+  // 3. Top-level sender.identifier (legacy format)
+  const sender = payload.sender;
   if (sender?.identifier && /^\d+$/.test(sender.identifier)) return sender.identifier;
-  // Fallback: phone_number minus the "+"
-  if (sender?.phone_number) {
-    const cleaned = sender.phone_number.replace(/[^\d]/g, '');
+  // 4. Phone number with non-digits stripped
+  const phone = metaSender?.phone_number ?? sender?.phone_number;
+  if (phone) {
+    const cleaned = phone.replace(/[^\d]/g, '');
     if (cleaned.length >= 10) return cleaned;
   }
   return null;
 }
 
 function pickMedia(
-  payload: z.infer<typeof chatwootMessagePayloadSchema>,
+  attachments?: Array<z.infer<typeof chatwootAttachmentSchema>>,
 ): NormalizedInbound['media'] {
-  const att = payload.attachments?.[0];
+  const att = attachments?.[0];
   if (!att?.data_url) return undefined;
-  // Chatwoot file_type values: image, audio, video, file, location, contact
   const mimeMap: Record<string, string> = {
     audio: 'audio/ogg',
     image: 'image/jpeg',
@@ -116,35 +183,51 @@ function pickMedia(
   return { url: att.data_url, mimeType };
 }
 
-function normalize(
-  payload: z.infer<typeof chatwootMessagePayloadSchema>,
-): NormalizedInbound | { skip: true; reason: string } {
-  if (!isIncomingMessage(payload)) {
-    return { skip: true, reason: `event=${payload.event ?? '?'} message_type=${payload.message_type ?? '?'}` };
+function normalize(payload: ChatwootPayload): NormalizedInbound | { skip: true; reason: string } {
+  // Pick the triggering message from conversation.messages[]
+  const msg = pickTriggeringMessage(payload);
+
+  // If no inbound found in messages array, also accept top-level legacy shape
+  // where {message_type, source_id, sender, content, private} are at root.
+  const legacyTopIsInbound = payload.message_type != null && isIncoming(payload);
+
+  if (!msg && !legacyTopIsInbound) {
+    return {
+      skip: true,
+      reason: `no inbound message — top message_type=${payload.message_type ?? '?'} private=${payload.private ?? '?'} messages_count=${payload.conversation?.messages?.length ?? 0}`,
+    };
   }
+
   const waId = pickWaId(payload);
-  if (!waId) return { skip: true, reason: 'cannot resolve wa_id from sender' };
+  if (!waId) {
+    return { skip: true, reason: 'cannot resolve wa_id (contact_inbox.source_id, meta.sender, or sender)' };
+  }
 
-  const sender = payload.sender ?? payload.conversation?.meta?.sender;
-  const chatwootMessageId =
-    payload.id != null ? String(payload.id) : undefined;
-  const conversationId =
-    payload.conversation?.id != null ? Number(payload.conversation.id) : undefined;
-
-  const sourceId =
-    payload.source_id && payload.source_id.startsWith('wamid.') ? payload.source_id : undefined;
+  // Content / wamid / chatwoot id come from the picked message OR top-level legacy
+  const content = msg?.content ?? payload.content ?? null;
+  const sourceId = msg?.source_id ?? payload.source_id;
+  const wamid = sourceId && sourceId.startsWith('wamid.') ? sourceId : undefined;
+  const chatwootMessageId = msg?.id != null ? String(msg.id) : payload.id != null ? String(payload.id) : undefined;
+  const conversationId = payload.conversation?.id != null ? Number(payload.conversation.id) : undefined;
+  const clientName = payload.conversation?.meta?.sender?.name ?? payload.sender?.name ?? undefined;
+  const media = pickMedia(msg?.attachments) ?? pickMedia(payload.attachments);
 
   return {
     channel: 'chatwoot',
     conversationId: waId,
-    externalMessageId: sourceId ?? chatwootMessageId,
+    externalMessageId: wamid ?? chatwootMessageId,
     chatwootMessageId,
     chatwootConversationId: conversationId,
-    clientName: sender?.name ?? undefined,
-    text: payload.content ?? undefined,
-    media: pickMedia(payload),
+    clientName,
+    text: content ?? undefined,
+    media,
   };
 }
+
+// Test-only re-exports so unit tests can hit the pure functions without
+// spinning up a Fastify instance.
+export const __test_normalize = normalize;
+export const __test_schema = chatwootMessagePayloadSchema;
 
 export async function chatwootWebhookRoutes(app: FastifyInstance) {
   app.post('/chatwoot', async (req, reply) => {
