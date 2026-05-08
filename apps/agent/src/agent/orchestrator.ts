@@ -21,6 +21,7 @@ import type {
 } from '@depf/shared';
 import { applyDeterministicRules, applyLLMRouter } from './router.js';
 import { getStageHandler, qaStage } from './stages/index.js';
+import { mergeCriteriaWithCurrent } from './criteria.js';
 import type { StageInput, AgentSettingsView } from './stages/types.js';
 import { Trace } from '../observability/tracer.js';
 import { applyAlwaysRespondGuard } from '../observability/fallback-guard.js';
@@ -604,15 +605,23 @@ export class Orchestrator {
     extractedData: Record<string, unknown>,
   ): Promise<void> {
     // Split extracted_data into searchCriteria fields vs reservation fields.
+    // Allow `_remove` and `_replace` siblings for the array criteria so the
+    // merger (criteria.ts) can honour "ya no importa Carmen" intents.
     const criteriaKeys = new Set([
       'fechaInicio',
       'fechaFin',
       'personas',
       'zona',
+      'zona_remove',
+      'zona_replace',
       'ciudad',
+      'ciudad_remove',
+      'ciudad_replace',
       'presupuestoMax',
       'tipoEvento',
       'amenidades',
+      'amenidades_remove',
+      'amenidades_replace',
       'mascotas',
     ]);
     const reservationKeys = new Set([
@@ -635,10 +644,23 @@ export class Orchestrator {
       }
     }
 
+    // Multi-turn criteria accumulation: load current, merge per v1 rules
+    // (union arrays, dedup, honour _remove/_replace), persist as full JSONB.
+    // This replaces the JSONB || operator approach which couldn't handle
+    // dedup or removal — the user saying "y también Girardot" + the LLM
+    // re-emitting "Carmen" in the next turn would otherwise lead to
+    // duplicates.
+    const cur = await query<{ search_criteria: Record<string, unknown> | null }>(
+      `SELECT search_criteria FROM conversations WHERE wa_id = $1`,
+      [conversationId],
+    );
+    const currentCriteria = cur.rows[0]?.search_criteria ?? {};
+    const mergedCriteria = mergeCriteriaWithCurrent(currentCriteria, criteriaPatch);
+
     await query(
       `UPDATE conversations
           SET current_stage = $2,
-              search_criteria = COALESCE(search_criteria, '{}'::jsonb) || $3::jsonb,
+              search_criteria = $3::jsonb,
               reservation = COALESCE(reservation, '{}'::jsonb) || $4::jsonb,
               selected_finca = COALESCE($5, selected_finca),
               shown_fincas = CASE
@@ -651,7 +673,7 @@ export class Orchestrator {
       [
         conversationId,
         nextStage,
-        JSON.stringify(criteriaPatch),
+        JSON.stringify(mergedCriteria),
         JSON.stringify(reservationPatch),
         chosenFincaId ?? null,
       ],
