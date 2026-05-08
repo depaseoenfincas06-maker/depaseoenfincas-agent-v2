@@ -65,12 +65,31 @@ export interface OrchestratorResult {
   outboundCount: number;
 }
 
+/** Detect the v1 RESET command. Case-insensitive, trim-tolerant; only the
+ *  exact word "RESET" (no other tokens). v1 used the same exact-match rule
+ *  so the customer can't accidentally trigger it with a sentence like
+ *  "did you reset?". */
+export function isResetCommand(text: string | null | undefined): boolean {
+  if (!text) return false;
+  return text.trim().toUpperCase() === 'RESET';
+}
+
+const RESET_REPLY = 'Listo. Reinicié nuestra conversación. Cuéntame, ¿en qué te puedo ayudar?';
+
 export class Orchestrator {
   async run(envelope: InboundEnvelope): Promise<OrchestratorResult> {
     const log = logger.child({
       conversationId: envelope.conversationId,
       inboxId: envelope.inboxId,
     });
+
+    // RESET command short-circuit — runs BEFORE persistInbound so we don't
+    // pollute the messages table with the RESET command itself, and BEFORE
+    // any agente_activo / global-bot-disabled gates so the customer can
+    // always recover even if the bot was paused. v1 parity.
+    if (isResetCommand(envelope.text)) {
+      return this.handleReset(envelope, log);
+    }
 
     // 1. Persist inbound as a message row + load context
     const inboundMessage = await this.persistInbound(envelope);
@@ -356,6 +375,79 @@ export class Orchestrator {
   private async runStage(stage: Stage, input: StageInput) {
     const handler = getStageHandler(stage);
     return handler.handle(input);
+  }
+
+  /**
+   * Handle the RESET command. v1 behaviour:
+   *
+   *   1. Look up chatwoot_conversation_id for this wa_id (we need it to
+   *      send the reply AFTER the row is deleted).
+   *   2. DELETE the conversations row — cascades to messages, agent_runs,
+   *      message_outbox, traces, follow_on. Net effect: the next inbound
+   *      starts a fresh conversation in QUALIFYING with no history.
+   *   3. Send the RESET confirmation reply to the customer via Chatwoot.
+   *      We use the chatwoot_conversation_id we cached BEFORE the delete.
+   *
+   * RESET runs before persistInbound, so the literal "RESET" message is
+   * never stored. We don't write a trace either — there's no conversation
+   * to attach it to and the action is fully audit-loggable from the row
+   * being deleted plus the outbound message landing in the outbox of the
+   * next conversation that gets created.
+   */
+  private async handleReset(
+    envelope: InboundEnvelope,
+    log: { info: (...args: unknown[]) => void; error: (...args: unknown[]) => void; warn: (...args: unknown[]) => void },
+  ): Promise<OrchestratorResult> {
+    log.info({ event: 'reset_command' }, 'RESET received — wiping conversation');
+
+    // 1. Resolve chatwoot_conversation_id BEFORE the delete cascade.
+    const ctxRow = await query<{
+      chatwoot_conversation_id: number | null;
+      client_name: string | null;
+    }>(
+      `SELECT chatwoot_conversation_id, client_name
+         FROM conversations WHERE wa_id = $1`,
+      [envelope.conversationId],
+    );
+    const chatwootId = ctxRow.rows[0]?.chatwoot_conversation_id;
+    const clientName = ctxRow.rows[0]?.client_name;
+
+    // 2. Delete the conversation row — ON DELETE CASCADE handles dependents.
+    // If there's no conversation yet (someone says RESET before any other
+    // inbound), there's nothing to delete and we just send the reply.
+    await query(`DELETE FROM conversations WHERE wa_id = $1`, [envelope.conversationId]);
+
+    // 3. Send the confirmation reply. If we don't have the chatwoot id
+    // (shouldn't happen in production but guard anyway), we just log and
+    // return — nothing to send via.
+    if (chatwootId == null) {
+      log.warn({}, 'RESET: no chatwoot_conversation_id found, skipping reply send');
+      return { traceId: '', status: 'silent', outboundCount: 0 };
+    }
+
+    try {
+      const adapter = getChannel(envelope.channel);
+      const result = await adapter.send(
+        {
+          waId: envelope.conversationId,
+          chatwootConversationId: Number(chatwootId),
+          ...(clientName ? { contactName: clientName } : {}),
+        },
+        { channel: envelope.channel, type: 'text', text: RESET_REPLY },
+      );
+      if (!result.delivered) {
+        log.error(
+          { reason: result.failureReason },
+          'RESET reply not delivered',
+        );
+        return { traceId: '', status: 'fallback', outboundCount: 0 };
+      }
+    } catch (err) {
+      log.error({ err }, 'RESET reply send threw');
+      return { traceId: '', status: 'error', outboundCount: 0 };
+    }
+
+    return { traceId: '', status: 'ok', outboundCount: 1 };
   }
 
   private async persistInbound(envelope: InboundEnvelope): Promise<{ id: string }> {

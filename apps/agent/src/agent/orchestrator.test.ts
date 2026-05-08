@@ -5,7 +5,30 @@
  * functions only.
  */
 import { describe, it, expect } from 'vitest';
-import { renderInitialGreeting } from './orchestrator.js';
+import { renderInitialGreeting, isResetCommand } from './orchestrator.js';
+
+describe('isResetCommand', () => {
+  it('detects exact RESET regardless of case', () => {
+    expect(isResetCommand('RESET')).toBe(true);
+    expect(isResetCommand('reset')).toBe(true);
+    expect(isResetCommand('Reset')).toBe(true);
+  });
+  it('tolerates surrounding whitespace', () => {
+    expect(isResetCommand('  RESET  ')).toBe(true);
+    expect(isResetCommand('\nreset\n')).toBe(true);
+  });
+  it('does NOT match RESET inside a longer message', () => {
+    expect(isResetCommand('please reset my conversation')).toBe(false);
+    expect(isResetCommand('did you reset?')).toBe(false);
+    expect(isResetCommand('RESET por favor')).toBe(false);
+  });
+  it('returns false for null/undefined/empty', () => {
+    expect(isResetCommand(null)).toBe(false);
+    expect(isResetCommand(undefined)).toBe(false);
+    expect(isResetCommand('')).toBe(false);
+    expect(isResetCommand('   ')).toBe(false);
+  });
+});
 
 describe('renderInitialGreeting', () => {
   it('substitutes {client_name} with leading space when name is present', () => {
