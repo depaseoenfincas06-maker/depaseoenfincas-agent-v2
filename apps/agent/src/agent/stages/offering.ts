@@ -30,14 +30,23 @@ REGLAS CRÍTICAS DE PRIVACIDAD:
 
 TONO: {TONE_GUIDELINES}
 
-CÓMO PRESENTAR FINCAS:
-- Cuando vayas a mostrar fincas, devuelve:
+CÓMO PRESENTAR FINCAS — REGLA INVIOLABLE:
+- Cuando muestres fincas devuelves SIEMPRE:
     intent: "SHOW_OPTIONS"
     next_stage: "OFFERING"
-    outbound_text: un PREÁMBULO breve (≤ 35 palabras) en español, conversacional, anunciando lo que viene. Ejemplo: "¡Genial! Encontré estas opciones para ti, mira a ver cuál te late más:"
-    fincas_mostradas: ARRAY con los OBJETOS COMPLETOS de las fincas que decidiste mostrar (los mismos objetos que devolvió list_matching_fincas — copia VERBATIM las propiedades). Hasta {MAX_PROPERTIES} fincas. NO inventes campos.
+    outbound_text: un PREÁMBULO breve (≤ 35 palabras) en español, conversacional. Ejemplos:
+        - Caso normal: "¡Genial! Encontré estas opciones para ti, mira a ver cuál te late más:"
+        - Caso similar_items (no hay match estricto): "En esa zona no tengo opciones disponibles, pero te muestro estas alternativas cercanas que pueden funcionarte:"
+    fincas_mostradas: ARRAY con los OBJETOS COMPLETOS, VERBATIM, tal como vienen del tool. Cópialos enteros sin omitir ningún campo. NO los resumas, NO los reescribas, NO inventes campos.
     done: true
-- El sistema construirá automáticamente las fichas con fotos. NO escribas la ficha en outbound_text — sólo el preámbulo.
+
+- El sistema construye AUTOMÁTICAMENTE las fichas con su formato (☀️🌴*PEREIRA #09*🌴☀️ + amenidades + tarifa) y luego envía las fotos. Para que esto pase tú DEBES pasar las fincas en fincas_mostradas.
+
+- PROHIBIDO: escribir las fichas como texto en outbound_text. Si lo haces, el cliente no verá las fotos y la ficha tendrá descripciones inventadas. SIEMPRE pasa los objetos en fincas_mostradas.
+
+- Si list_matching_fincas devolvió matches=[] y similar_items=[…X items], usa los similar_items en fincas_mostradas y avisa en el preámbulo.
+
+- Si AMBOS están vacíos: intent="NO_MATCH", outbound_text="No encontré opciones que cumplan esos criterios. ¿Quieres ajustar algo (fechas, presupuesto, zona)?", fincas_mostradas=[].
 
 CUANDO EL CLIENTE ELIGE:
 - Si dice "la 2", "el F003", "la del río", mapea a la finca correspondiente y devuelve:
@@ -136,7 +145,12 @@ class OfferingStage implements StageHandler {
       // Execute tools and feed results back.
       const toolResults: Array<{ name: string; input: unknown; output: unknown }> = [];
       for (const call of data.tool_calls ?? []) {
-        const out = await executeInventoryTool(call.name, call.input);
+        const out = await executeInventoryTool(call.name, call.input, {
+          searchCriteria: input.conversation.searchCriteria as Record<string, unknown> | undefined,
+          ...(input.settings.ownerContactOverride
+            ? { ownerContactOverride: input.settings.ownerContactOverride }
+            : {}),
+        });
         toolResults.push({ name: call.name, input: call.input, output: out });
         toolCallLog.push({ name: call.name, input: call.input, output: out });
       }
