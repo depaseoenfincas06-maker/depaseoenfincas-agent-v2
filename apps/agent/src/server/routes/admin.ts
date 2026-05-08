@@ -17,15 +17,22 @@ const settingsPatchSchema = z
     toneGuidelinesExtra: z.string().nullable().optional(),
     initialMessageTemplate: z.string().nullable().optional(),
     handoffMessage: z.string().nullable().optional(),
-    companyKnowledge: z.record(z.unknown()).optional(),
+    companyKnowledge: z.union([z.record(z.unknown()), z.string()]).optional(),
     companyDocuments: z.array(z.record(z.unknown())).optional(),
-    paymentMethods: z.record(z.unknown()).optional(),
+    paymentMethods: z.union([z.record(z.unknown()), z.string()]).optional(),
     inventorySheetId: z.string().nullable().optional(),
     inventorySheetTab: z.string().nullable().optional(),
     followupSettings: z.record(z.unknown()).optional(),
     selectionNotificationSettings: z.record(z.unknown()).optional(),
     ownerTestMode: z.boolean().optional(),
     confirmationSettings: z.record(z.unknown()).optional(),
+    // ----- new v1-parity fields -----
+    promptAddenda: z.record(z.string().nullable()).optional(),
+    coverageZones: z.string().nullable().optional(),
+    publicAppBaseUrl: z.string().nullable().optional(),
+    maxPropertiesToShow: z.number().int().min(1).max(10).optional(),
+    globalBotEnabled: z.boolean().optional(),
+    ownerContactOverride: z.string().nullable().optional(),
   })
   .strict();
 
@@ -58,13 +65,29 @@ export async function adminRoutes(app: FastifyInstance) {
       selectionNotificationSettings: 'selection_notification_settings',
       ownerTestMode: 'owner_test_mode',
       confirmationSettings: 'confirmation_settings',
+      promptAddenda: 'prompt_addenda',
+      coverageZones: 'coverage_zones',
+      publicAppBaseUrl: 'public_app_base_url',
+      maxPropertiesToShow: 'max_properties_to_show',
+      globalBotEnabled: 'global_bot_enabled',
+      ownerContactOverride: 'owner_contact_override',
     };
+    // Columns that always get serialized to JSONB even when value is a primitive
+    // (e.g. companyKnowledge can be a free-form string in the v1 form, but the
+    // column is JSONB in DB — wrap in JSON).
+    const jsonbCols = new Set([
+      'company_knowledge',
+      'company_documents',
+      'payment_methods',
+      'followup_settings',
+      'selection_notification_settings',
+      'confirmation_settings',
+      'prompt_addenda',
+    ]);
     for (const [k, v] of Object.entries(data)) {
       const col = map[k];
       if (!col) continue;
-      const isJson =
-        typeof v === 'object' && v !== null && (Array.isArray(v) || k.endsWith('Knowledge') || k.endsWith('Documents') || k.endsWith('Methods') || k.endsWith('Settings'));
-      if (isJson) {
+      if (jsonbCols.has(col)) {
         cols.push(`${col} = $${p}::jsonb`);
         vals.push(JSON.stringify(v));
       } else {

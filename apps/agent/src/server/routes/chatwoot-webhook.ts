@@ -17,6 +17,7 @@ import { z } from 'zod';
 import { pool } from '../../persistence/db.js';
 import { enqueueMessageJob } from '../../queue/index.js';
 import { config } from '../../config.js';
+import { flexibleNormalize } from './_flexible-normalize.js';
 
 // Tolerant schema — Chatwoot evolves its payload; we want to accept what we
 // recognize and ignore the rest, never reject a well-formed message.
@@ -241,15 +242,38 @@ export async function chatwootWebhookRoutes(app: FastifyInstance) {
     }
 
     const parsed = chatwootMessagePayloadSchema.safeParse(req.body);
-    if (!parsed.success) {
-      req.log.warn({ issues: parsed.error.issues }, 'invalid chatwoot payload — acking with 200 to prevent retries');
-      return reply.send({ ok: true, ignored: true, reason: 'invalid payload' });
+    let normalized: NormalizedInbound | { skip: true; reason: string } = { skip: true, reason: 'not parsed yet' };
+
+    // Step 1: try the strict Chatwoot-aware normalizer
+    if (parsed.success) {
+      normalized = normalize(parsed.data);
+    } else {
+      req.log.warn({ issues: parsed.error.issues.slice(0, 5) }, 'strict schema parse failed — will try flexible');
     }
 
-    const normalized = normalize(parsed.data);
+    // Step 2: if strict skipped, fall back to the flexible heuristic. This
+    // makes us accept payloads from new Chatwoot versions, Meta directly,
+    // custom integrations — anything that has a phone + text somewhere.
     if ('skip' in normalized) {
-      req.log.info({ reason: normalized.reason }, 'chatwoot event skipped');
-      return reply.send({ ok: true, ignored: true, reason: normalized.reason });
+      const flex = flexibleNormalize(req.body);
+      if ('skip' in flex) {
+        req.log.info(
+          { strictReason: normalized.reason, flexReason: flex.reason, found: flex.found },
+          'webhook ignored — neither strict nor flexible could normalize',
+        );
+        return reply.send({ ok: true, ignored: true, reason: `strict=${normalized.reason}; flex=${flex.reason}` });
+      }
+      req.log.info({ strictReason: normalized.reason, waId: flex.waId }, 'flexible normalizer rescued the payload');
+      normalized = {
+        channel: 'chatwoot',
+        conversationId: flex.waId,
+        externalMessageId: flex.externalMessageId,
+        chatwootMessageId: flex.chatwootMessageId,
+        chatwootConversationId: flex.chatwootConversationId,
+        clientName: flex.clientName,
+        text: flex.text ?? undefined,
+        media: flex.media,
+      };
     }
 
     // Idempotency: if we already have a message with this external_message_id,
