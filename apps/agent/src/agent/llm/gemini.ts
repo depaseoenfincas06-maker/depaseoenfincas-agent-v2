@@ -13,6 +13,7 @@ import {
   type LLMRequest,
   type LLMResult,
 } from './provider.js';
+import { parseLLMJson } from './parse-output.js';
 
 const MAX_PARSE_RETRIES = 1;
 const DEFAULT_TIMEOUT_MS = 30_000;
@@ -37,14 +38,6 @@ function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
       },
     );
   });
-}
-
-function extractJson(text: string): string {
-  // Gemini sometimes wraps JSON in ```json fences despite mime type.
-  const trimmed = text.trim();
-  const fence = /^```(?:json)?\s*([\s\S]*?)\s*```$/;
-  const match = trimmed.match(fence);
-  return match?.[1] ?? trimmed;
 }
 
 class GeminiProvider implements LLMProvider {
@@ -95,13 +88,13 @@ class GeminiProvider implements LLMProvider {
           `gemini.${req.name}`,
         );
         rawText = result.response.text();
-        const cleaned = extractJson(rawText);
-        let parsed: unknown;
-        try {
-          parsed = JSON.parse(cleaned);
-        } catch (parseErr) {
-          // Re-throw as SyntaxError so the catch below triggers a corrective retry.
-          throw parseErr;
+        // Robust parse with v1 salvage layers (fences, balanced object,
+        // control char escape). Only throw if EVERY layer fails — this
+        // catches the common Gemini-emits-markdown / trailing-commentary
+        // failure modes without burning a retry round-trip.
+        const parsed = parseLLMJson(rawText);
+        if (parsed == null) {
+          throw createLLMError('malformed', 'failed to extract JSON from LLM response', { rawText });
         }
         const validated = req.schema.safeParse(parsed);
         if (!validated.success) {
