@@ -233,54 +233,65 @@ export const __test_normalize = normalize;
 export const __test_schema = chatwootMessagePayloadSchema;
 
 /**
- * Auth check for the Chatwoot webhook. Chatwoot does NOT send the secret
- * literally as a header — it signs each payload with HMAC-SHA256 using the
- * configured Secret and sends the result in `x-chatwoot-signature: sha256=…`.
- * We accept three modes:
+ * Auth check for the Chatwoot webhook. Tolerant signature parsing:
+ *  - "sha256=HEX"   (Chatwoot's documented format)
+ *  - "HEX"          (some payloads/versions omit the prefix)
+ *  - "SHA256=HEX"   (case variations)
+ *  - Trims surrounding whitespace
  *
- *   1. HMAC verification (real Chatwoot deliveries):
- *      computed = HMAC-SHA256(WEBHOOK_SHARED_SECRET, raw_body)
- *      compare to x-chatwoot-signature, constant-time
- *
- *   2. Literal `x-webhook-secret` header (manual curl tests, simulators,
- *      legacy callers). Convenient for ops debugging.
- *
- *   3. If WEBHOOK_SHARED_SECRET is unset, accept any caller (open mode —
- *      relies on URL secrecy alone). Useful for early dev / smoke tests.
- *
- * Originally we ONLY checked mode 2, which silently 401'd every real
- * Chatwoot delivery and led to Chatwoot disabling the webhook entirely.
+ * Returns auth state plus computed HMAC + raw signature so the caller can
+ * stash them in the debug log for diagnosis. Constant-time hex compare.
  */
-function verifyAuth(req: FastifyRequest): { ok: true } | { ok: false; reason: string } {
-  if (!config.WEBHOOK_SHARED_SECRET) return { ok: true };
+interface AuthResult {
+  ok: boolean;
+  reason: string;
+  signatureRaw: string;
+  computedHmac: string;
+}
+
+function verifyAuth(req: FastifyRequest): AuthResult {
+  if (!config.WEBHOOK_SHARED_SECRET) {
+    return { ok: true, reason: 'no secret configured (open mode)', signatureRaw: '', computedHmac: '' };
+  }
 
   const literal = req.headers['x-webhook-secret'];
-  if (typeof literal === 'string' && literal === config.WEBHOOK_SHARED_SECRET) {
-    return { ok: true };
+  const literalStr = Array.isArray(literal) ? literal[0] : literal;
+  if (typeof literalStr === 'string' && literalStr === config.WEBHOOK_SHARED_SECRET) {
+    return { ok: true, reason: 'literal x-webhook-secret matched', signatureRaw: '', computedHmac: '' };
   }
 
-  const sig = req.headers['x-chatwoot-signature'];
-  const sigStr = Array.isArray(sig) ? sig[0] : sig;
-  if (typeof sigStr === 'string') {
-    const m = sigStr.match(/^sha256=([a-f0-9]+)$/i);
-    if (m) {
-      const raw = (req as unknown as { rawBody?: string }).rawBody;
-      if (typeof raw === 'string' && raw.length > 0) {
-        const computed = createHmac('sha256', config.WEBHOOK_SHARED_SECRET).update(raw).digest('hex');
-        const a = Buffer.from(m[1]!.toLowerCase(), 'hex');
-        const b = Buffer.from(computed.toLowerCase(), 'hex');
-        if (a.length === b.length && timingSafeEqual(a, b)) {
-          return { ok: true };
-        }
-        return { ok: false, reason: 'x-chatwoot-signature HMAC mismatch' };
-      }
-      return { ok: false, reason: 'cannot verify HMAC: rawBody not captured' };
-    }
+  // Locate signature header (Chatwoot uses x-chatwoot-signature).
+  const sigHeader = req.headers['x-chatwoot-signature'] ?? req.headers['x-hub-signature-256'];
+  const sigRaw = (Array.isArray(sigHeader) ? sigHeader[0] : sigHeader) ?? '';
+  const sigStr = String(sigRaw).trim();
+
+  // Extract the hex digest tolerantly. Accept "sha256=HEX" or just "HEX".
+  let hex = '';
+  const m = sigStr.match(/^(?:sha256=)?([a-fA-F0-9]+)$/i);
+  if (m) hex = m[1]!.toLowerCase();
+
+  const raw = (req as unknown as { rawBody?: string }).rawBody;
+
+  if (!hex || !raw || raw.length === 0) {
+    return {
+      ok: false,
+      reason: `missing/invalid signature: hexLen=${hex.length} rawLen=${raw?.length ?? 0} sigRaw=${sigStr.slice(0, 30)}`,
+      signatureRaw: sigStr,
+      computedHmac: '',
+    };
   }
 
+  const computed = createHmac('sha256', config.WEBHOOK_SHARED_SECRET).update(raw).digest('hex');
+  const a = Buffer.from(hex, 'hex');
+  const b = Buffer.from(computed, 'hex');
+  if (a.length === b.length && timingSafeEqual(a, b)) {
+    return { ok: true, reason: 'HMAC matched', signatureRaw: sigStr, computedHmac: computed };
+  }
   return {
     ok: false,
-    reason: 'no valid auth: x-webhook-secret literal mismatch and x-chatwoot-signature missing/invalid',
+    reason: `HMAC mismatch: expected=${hex.slice(0, 12)} computed=${computed.slice(0, 12)} bodyLen=${raw.length}`,
+    signatureRaw: sigStr,
+    computedHmac: computed,
   };
 }
 
@@ -294,6 +305,8 @@ async function logDebugHit(
   req: FastifyRequest,
   authResult: string,
   outcome: string,
+  signatureRaw: string,
+  computedHmac: string,
 ): Promise<void> {
   try {
     const body = (req as unknown as { rawBody?: string }).rawBody ?? '';
@@ -302,8 +315,9 @@ async function logDebugHit(
       `INSERT INTO webhook_debug_log
         (path, method, remote_ip, user_agent, content_type, content_length,
          has_chatwoot_signature, has_webhook_secret_header,
-         auth_result, outcome, body_preview, headers_json)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::jsonb)`,
+         auth_result, outcome, body_preview, body_full,
+         signature_raw, computed_hmac, headers_json)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15::jsonb)`,
       [
         req.url,
         req.method,
@@ -316,6 +330,9 @@ async function logDebugHit(
         authResult,
         outcome,
         body.slice(0, 1000),
+        body,
+        signatureRaw,
+        computedHmac,
         JSON.stringify(headers),
       ],
     );
@@ -329,7 +346,7 @@ export async function chatwootWebhookRoutes(app: FastifyInstance) {
     const auth = verifyAuth(req);
     if (!auth.ok) {
       req.log.warn({ reason: auth.reason }, 'chatwoot webhook auth failed');
-      await logDebugHit(req, auth.reason, 'unauthorized');
+      await logDebugHit(req, auth.reason, 'unauthorized', auth.signatureRaw, auth.computedHmac);
       return reply.unauthorized(auth.reason);
     }
 
@@ -353,7 +370,7 @@ export async function chatwootWebhookRoutes(app: FastifyInstance) {
           { strictReason: normalized.reason, flexReason: flex.reason, found: flex.found },
           'webhook ignored — neither strict nor flexible could normalize',
         );
-        await logDebugHit(req, 'auth-ok', 'ignored');
+        await logDebugHit(req, auth.reason, 'ignored', auth.signatureRaw, auth.computedHmac);
         return reply.send({ ok: true, ignored: true, reason: `strict=${normalized.reason}; flex=${flex.reason}` });
       }
       req.log.info({ strictReason: normalized.reason, waId: flex.waId }, 'flexible normalizer rescued the payload');
@@ -378,7 +395,7 @@ export async function chatwootWebhookRoutes(app: FastifyInstance) {
       );
       if (existing.rows.length > 0) {
         req.log.info({ externalMessageId: normalized.externalMessageId }, 'duplicate chatwoot webhook — already processed');
-        await logDebugHit(req, 'auth-ok', 'duplicate');
+        await logDebugHit(req, auth.reason, 'duplicate', auth.signatureRaw, auth.computedHmac);
         return reply.send({ ok: true, duplicate: true });
       }
     }
@@ -408,7 +425,7 @@ export async function chatwootWebhookRoutes(app: FastifyInstance) {
       enqueuedAt: new Date().toISOString(),
     });
 
-    await logDebugHit(req, 'auth-ok', 'processed');
+    await logDebugHit(req, auth.reason, 'processed', auth.signatureRaw, auth.computedHmac);
     return reply.send({ ok: true, inboxId });
   });
 }

@@ -19,6 +19,9 @@ CREATE TABLE IF NOT EXISTS webhook_debug_log (
   auth_result text,                  -- 'ok-hmac' | 'ok-literal' | 'ok-open' | 'fail-no-match' | 'fail-no-rawbody'
   outcome text,                       -- 'processed' | 'duplicate' | 'ignored' | 'unauthorized' | 'parse_error'
   body_preview text,                  -- first 1000 chars, for quick eyeball
+  body_full text,                     -- complete raw body, for HMAC replay
+  signature_raw text,                 -- exact x-chatwoot-signature header value
+  computed_hmac text,                 -- HMAC computed by us, for diff diagnosis
   headers_json jsonb,
   created_at timestamptz NOT NULL DEFAULT now()
 );
