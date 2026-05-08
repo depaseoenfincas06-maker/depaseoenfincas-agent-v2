@@ -40,6 +40,24 @@ interface InboundEnvelope {
   inboxId: string;
 }
 
+/**
+ * Substitute {client_name} placeholder (and a couple of common variants) in
+ * the initial message template. If we don't have a name we just drop the
+ * substitution gracefully — the rest of the template still reads fine.
+ */
+export function renderInitialGreeting(template: string, clientName: string | null): string {
+  const name = clientName?.trim() ?? '';
+  // Replace the placeholder. Spaces around the placeholder collapse if name
+  // is empty (so "Hola{client_name}, ..." stays clean).
+  let out = template
+    .replace(/\{client_name\}/g, name ? ` ${name}` : '')
+    .replace(/\{clientName\}/g, name ? ` ${name}` : '')
+    .replace(/\{name\}/g, name);
+  // Collapse any accidental double-space introduced by an empty substitution.
+  out = out.replace(/[ \t]{2,}/g, ' ');
+  return out;
+}
+
 export interface OrchestratorResult {
   traceId: string;
   status: 'ok' | 'silent' | 'fallback' | 'error';
@@ -149,6 +167,56 @@ export class Orchestrator {
         silenceReason: 'GLOBAL_BOT_DISABLED',
       });
       return { traceId: trace.id, status: 'silent', outboundCount: 0 };
+    }
+
+    // Short-circuit: first inbound on a brand-new conversation → send the
+    // configured initial_message_template (verbatim, with {client_name}
+    // substitution). This matches v1 behavior where the agent always opens
+    // with Santiago's structured "Excelente día!🤩🌅..." greeting before
+    // engaging in real qualification. The user's first message content is
+    // already persisted; QUALIFYING will see it on the NEXT inbound when
+    // they reply with the requested fields.
+    //
+    // Detection: recent.length === 1 means the only message in history is
+    // the inbound we just persisted. If they had ever messaged before, recent
+    // would have ≥2 (inbound + our prior reply).
+    if (
+      recent.length === 1 &&
+      settings.initialMessageTemplate &&
+      settings.initialMessageTemplate.trim().length > 0
+    ) {
+      const greeting = renderInitialGreeting(
+        settings.initialMessageTemplate,
+        conversation.clientName ?? null,
+      );
+      const greetingOutbound: OutboundMessage = {
+        channel: envelope.channel,
+        type: 'text',
+        text: greeting,
+      };
+      await this.deliverOutbound(envelope.conversationId, [greetingOutbound], trace.id);
+      // Record a synthetic agent_turn so the dashboard shows what happened.
+      await trace.recordTurn({
+        stage: 'QUALIFYING',
+        model: 'template',
+        prompt: { kind: 'initial_message_template', template: settings.initialMessageTemplate },
+        response: { text: greeting },
+        toolsCalled: [],
+        tokensIn: null,
+        tokensOut: null,
+        costUsd: null,
+        latencyMs: null,
+        status: 'ok',
+      });
+      await this.persistConversationUpdate(envelope.conversationId, conversation.currentStage, {});
+      await trace.finalize({
+        stageAfter: conversation.currentStage,
+        intent: 'GREETING',
+        outboundCount: 1,
+        status: 'ok',
+      });
+      log.info({ template: 'initial_message_template' }, 'first-inbound greeting sent');
+      return { traceId: trace.id, status: 'ok', outboundCount: 1 };
     }
 
     // Short-circuit: empty audio transcription → fallback
