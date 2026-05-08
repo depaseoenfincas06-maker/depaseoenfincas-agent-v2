@@ -12,7 +12,7 @@
  */
 import { request } from 'undici';
 import type { OutboundMessage } from '@depf/shared';
-import type { ChannelAdapter, SendResult, TypingPayload } from './types.js';
+import type { ChannelAdapter, SendContext, SendResult, TypingPayload } from './types.js';
 import { config } from '../config.js';
 import { logger } from '../observability/logger.js';
 
@@ -42,12 +42,12 @@ async function metaPost(phoneNumberId: string, body: Record<string, unknown>) {
 class WhatsAppChannel implements ChannelAdapter {
   readonly channel = 'whatsapp' as const;
 
-  async send(): Promise<SendResult> {
+  async send(_ctx: SendContext): Promise<SendResult> {
     // Client-side outbound goes via Chatwoot for handoff visibility.
     throw new Error('WhatsApp direct send not used for clients; outbound goes via chatwoot adapter');
   }
 
-  async showTyping(_conversationId: string, payload: TypingPayload): Promise<void> {
+  async showTyping(_ctx: SendContext, payload: TypingPayload): Promise<void> {
     if (!config.WHATSAPP_PHONE_NUMBER_ID) return;
     if (!payload.inResponseTo || !payload.inResponseTo.startsWith('wamid.')) return;
     try {

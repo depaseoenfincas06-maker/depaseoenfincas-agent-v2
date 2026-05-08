@@ -491,50 +491,83 @@ export class Orchestrator {
     }));
   }
 
+  /**
+   * Send each outbound through the right channel adapter, then persist the
+   * result. The adapter receives a SendContext with both wa_id and the
+   * Chatwoot internal numeric conversation_id so it can hit Chatwoot's
+   * /conversations/{id} URL correctly. Without this, sends 404'd silently
+   * (status='sent' was hardcoded — fixed below to honor sendResult.delivered).
+   */
   private async deliverOutbound(
     conversationId: string,
     outbound: OutboundMessage[],
     traceId: string,
   ): Promise<void> {
+    if (outbound.length === 0) return;
+
+    // Resolve the chatwoot_conversation_id once (and contact name) before
+    // delivering each message in this turn.
+    const ctxRow = await query<{
+      wa_id: string;
+      chatwoot_conversation_id: number | null;
+      client_name: string | null;
+    }>(
+      `SELECT wa_id, chatwoot_conversation_id, client_name
+         FROM conversations WHERE wa_id = $1`,
+      [conversationId],
+    );
+    const row = ctxRow.rows[0];
+    const ctx = {
+      waId: conversationId,
+      chatwootConversationId:
+        row?.chatwoot_conversation_id != null ? Number(row.chatwoot_conversation_id) : undefined,
+      contactName: row?.client_name ?? undefined,
+    };
+
     for (const msg of outbound) {
       const adapter = getChannel(msg.channel);
+      let sendResult;
+      let errMsg: string | undefined;
       try {
-        const sendResult = await adapter.send(conversationId, msg);
-        await withTx(async (client) => {
-          await client.query(
-            `INSERT INTO messages
-               (conversation_id, external_message_id, direction, message_type, content)
-               VALUES ($1, $2, 'outbound', 'TEXT', $3)`,
-            [conversationId, sendResult.externalMessageId ?? null, msg.text ?? ''],
-          );
-          await client.query(
-            `INSERT INTO message_outbox
-               (trace_id, conversation_id, channel, payload, status, sent_at, external_message_id)
-               VALUES ($1, $2, $3, $4::jsonb, 'sent', now(), $5)`,
-            [
-              traceId,
-              conversationId,
-              msg.channel,
-              JSON.stringify(msg),
-              sendResult.externalMessageId ?? null,
-            ],
-          );
-        });
+        sendResult = await adapter.send(ctx, msg);
       } catch (err) {
-        logger.error({ err, conversationId }, 'channel send failed');
-        await query(
+        errMsg = err instanceof Error ? err.message : String(err);
+        sendResult = { delivered: false, failureReason: errMsg };
+      }
+
+      const status = sendResult.delivered ? 'sent' : 'failed';
+      const lastError = sendResult.delivered ? null : (sendResult.failureReason ?? errMsg ?? 'unknown failure');
+
+      // Persist BOTH the messages row (visible in dashboard) and the outbox
+      // row (delivery audit). Even on failure, persist so we have a record.
+      await withTx(async (client) => {
+        await client.query(
+          `INSERT INTO messages
+             (conversation_id, external_message_id, direction, message_type, content)
+             VALUES ($1, $2, 'outbound', 'TEXT', $3)`,
+          [conversationId, sendResult.externalMessageId ?? null, msg.text ?? ''],
+        );
+        await client.query(
           `INSERT INTO message_outbox
-             (trace_id, conversation_id, channel, payload, status, last_error)
-             VALUES ($1, $2, $3, $4::jsonb, 'failed', $5)`,
+             (trace_id, conversation_id, channel, payload, status, sent_at, external_message_id, last_error)
+             VALUES ($1, $2, $3, $4::jsonb, $5, ${sendResult.delivered ? 'now()' : 'NULL'}, $6, $7)`,
           [
             traceId,
             conversationId,
             msg.channel,
             JSON.stringify(msg),
-            err instanceof Error ? err.message : String(err),
+            status,
+            sendResult.externalMessageId ?? null,
+            lastError,
           ],
         );
-        throw err;
+      });
+
+      if (!sendResult.delivered) {
+        logger.error(
+          { conversationId, channel: msg.channel, reason: lastError },
+          'outbound message NOT delivered',
+        );
       }
     }
   }

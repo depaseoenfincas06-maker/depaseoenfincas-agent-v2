@@ -5,7 +5,7 @@
 import { EventEmitter } from 'node:events';
 import { randomUUID } from 'node:crypto';
 import type { OutboundMessage } from '@depf/shared';
-import type { ChannelAdapter, SendResult } from './types.js';
+import type { ChannelAdapter, SendContext, SendResult } from './types.js';
 
 interface BufferedMessage {
   id: string;
@@ -18,17 +18,17 @@ class SimulatorChannel extends EventEmitter implements ChannelAdapter {
   readonly channel = 'simulator' as const;
   private buffer = new Map<string, BufferedMessage[]>();
 
-  async send(conversationId: string, message: OutboundMessage): Promise<SendResult> {
+  async send(ctx: SendContext, message: OutboundMessage): Promise<SendResult> {
     const id = randomUUID();
     const entry: BufferedMessage = {
       id,
-      conversationId,
+      conversationId: ctx.waId,
       message,
       sentAt: new Date().toISOString(),
     };
-    const list = this.buffer.get(conversationId) ?? [];
+    const list = this.buffer.get(ctx.waId) ?? [];
     list.push(entry);
-    this.buffer.set(conversationId, list);
+    this.buffer.set(ctx.waId, list);
     this.emit('message', entry);
     return { externalMessageId: id, delivered: true };
   }
