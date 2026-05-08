@@ -20,6 +20,21 @@ interface ChatwootMessageResponse {
   [key: string]: unknown;
 }
 
+/** Pick a file extension matching the MIME type so Chatwoot can re-derive
+ *  the correct attachment_type (image/video/file). Defaults to .bin. */
+function mimeToExt(mime: string): string {
+  const m = mime.toLowerCase();
+  if (m.includes('jpeg') || m.includes('jpg')) return 'jpg';
+  if (m.includes('png')) return 'png';
+  if (m.includes('webp')) return 'webp';
+  if (m.includes('gif')) return 'gif';
+  if (m.includes('mp4')) return 'mp4';
+  if (m.includes('quicktime')) return 'mov';
+  if (m.includes('pdf')) return 'pdf';
+  if (m.includes('mpeg') || m.includes('audio')) return 'mp3';
+  return 'bin';
+}
+
 class ChatwootChannel implements ChannelAdapter {
   readonly channel = 'chatwoot' as const;
 
@@ -93,16 +108,17 @@ class ChatwootChannel implements ChannelAdapter {
   }
 
   /**
-   * Send a message with attachments. Chatwoot's API accepts:
-   *   - For URLs already hosted somewhere public (Google Drive folder IDs etc):
-   *     POST multipart/form-data with `attachment[]` set to the public URL.
-   *   - For binary uploads, include the file as form-data part.
+   * Send a message with attachments. Chatwoot's API requires BINARY uploads
+   * via multipart/form-data with `attachments[]` file parts — there is no
+   * official "give me a URL and fetch it server-side" mechanism in the
+   * standard Cloud or self-hosted versions. So we fetch the URL ourselves
+   * (typically Google Drive direct-link URLs from the inventory sheet),
+   * stream the bytes into the form, and let Chatwoot relay them onward to
+   * Meta WhatsApp.
    *
-   * For now we support URL attachments (the v1 finca cards reference Google
-   * Drive folder URLs, which Meta WhatsApp dereferences and uploads itself
-   * once the message goes through the integration). For binary blobs (e.g.
-   * the reservation PDF generated locally) we use the `data:` URI scheme,
-   * which Chatwoot accepts and converts.
+   * For attachments already supplied as base64 (`data` field) — like the
+   * reservation PDF generated locally — we decode and attach directly,
+   * skipping the network fetch.
    */
   private async sendMediaMessage(ctx: SendContext, message: OutboundMessage): Promise<SendResult> {
     const attachments = message.attachments ?? [];
@@ -115,7 +131,7 @@ class ChatwootChannel implements ChannelAdapter {
     const url = `${this.baseUrl}/api/v1/accounts/${config.CHATWOOT_ACCOUNT_ID}/conversations/${ctx.chatwootConversationId}/messages`;
 
     // Build a multipart form body. Chatwoot expects the parts named
-    // `content`, `message_type`, `private`, and `attachments[]`.
+    // `content`, `message_type`, `private`, and `attachments[]` (binary).
     const boundary = `----depf-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
     const lines: Buffer[] = [];
     const enc = (s: string) => Buffer.from(s, 'utf8');
@@ -128,27 +144,88 @@ class ChatwootChannel implements ChannelAdapter {
       lines.push(crlf);
     };
 
+    const appendBinary = (
+      fieldName: string,
+      filename: string,
+      mimeType: string,
+      buffer: Buffer,
+    ) => {
+      lines.push(enc(`--${boundary}\r\n`));
+      lines.push(
+        enc(`Content-Disposition: form-data; name="${fieldName}"; filename="${filename}"\r\n`),
+      );
+      lines.push(enc(`Content-Type: ${mimeType}\r\n\r\n`));
+      lines.push(buffer);
+      lines.push(crlf);
+    };
+
     append('content', message.text ?? '');
     append('message_type', 'outgoing');
     append('private', 'false');
 
-    // We can pass either a `attachments[]` field as a URL string for hosted
-    // images (Chatwoot fetches it server-side), or we can fetch it ourselves
-    // and upload as binary. Hosted URL is simpler — try that first.
-    for (const att of attachments) {
-      if (att.url) {
-        append('attachment_url[]', att.url);
-      } else if (att.data) {
-        // Decode base64 and append as a file part
-        const buffer = Buffer.from(att.data, 'base64');
-        const filename = att.filename ?? 'attachment';
-        const mimeType = att.mimeType ?? 'application/octet-stream';
-        lines.push(enc(`--${boundary}\r\n`));
-        lines.push(enc(`Content-Disposition: form-data; name="attachments[]"; filename="${filename}"\r\n`));
-        lines.push(enc(`Content-Type: ${mimeType}\r\n\r\n`));
-        lines.push(buffer);
-        lines.push(crlf);
+    // Fetch each URL attachment in parallel and then append as binary parts.
+    // We bound each fetch with a 15s timeout — if a photo URL is slow we'd
+    // rather drop it than block the whole reply. Failures are logged but
+    // the message still goes out with whatever attachments did succeed.
+    const fetched = await Promise.all(
+      attachments.map(async (att, idx) => {
+        if (att.data) {
+          // Already base64 — decode and use directly
+          return {
+            ok: true as const,
+            buffer: Buffer.from(att.data, 'base64'),
+            filename: att.filename ?? `attachment-${idx + 1}`,
+            mimeType: att.mimeType ?? 'application/octet-stream',
+          };
+        }
+        if (!att.url) return { ok: false as const, reason: 'no url and no data' };
+        try {
+          const r = await request(att.url, {
+            method: 'GET',
+            headersTimeout: 15_000,
+            bodyTimeout: 15_000,
+          });
+          if (r.statusCode < 200 || r.statusCode >= 300) {
+            return { ok: false as const, reason: `fetch ${att.url} → ${r.statusCode}` };
+          }
+          const arrayBuf = await r.body.arrayBuffer();
+          const ct = String(r.headers['content-type'] ?? att.mimeType ?? 'image/jpeg').split(';')[0]!.trim();
+          const ext = mimeToExt(ct);
+          return {
+            ok: true as const,
+            buffer: Buffer.from(arrayBuf),
+            filename: att.filename ?? `photo-${idx + 1}.${ext}`,
+            mimeType: ct,
+          };
+        } catch (err) {
+          return {
+            ok: false as const,
+            reason: err instanceof Error ? err.message : String(err),
+          };
+        }
+      }),
+    );
+
+    let appendedCount = 0;
+    for (const item of fetched) {
+      if (item.ok) {
+        appendBinary('attachments[]', item.filename, item.mimeType, item.buffer);
+        appendedCount += 1;
+      } else {
+        logger.warn({ reason: item.reason, waId: ctx.waId }, 'attachment fetch failed — skipping');
       }
+    }
+
+    if (appendedCount === 0) {
+      // No attachments resolved — fall back to text-only so the user still
+      // sees the card content. Better than silence.
+      if (message.text) {
+        return this.sendTextMessage(ctx, message);
+      }
+      return {
+        delivered: false,
+        failureReason: 'all attachment fetches failed and no fallback text',
+      };
     }
 
     lines.push(enc(`--${boundary}--\r\n`));
