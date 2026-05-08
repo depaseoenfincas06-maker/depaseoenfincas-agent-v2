@@ -864,7 +864,20 @@ export class Orchestrator {
       contactName: row?.client_name ?? undefined,
     };
 
-    for (const msg of outbound) {
+    for (let i = 0; i < outbound.length; i += 1) {
+      const msg = outbound[i]!;
+      // Tiny delay BETWEEN messages so the customer sees them as separate
+      // beats instead of an avalanche. v1 parity: the QUALIFYING "te busco"
+      // text and the OFFERING cards arrive as distinct WhatsApp bubbles.
+      // Skip the delay before the first message and before media items
+      // following their own card (those should ride together).
+      if (i > 0) {
+        const prev = outbound[i - 1]!;
+        const prevWasCard = prev.type === 'text' && (prev.text ?? '').includes('☀️🌴');
+        const thisIsMediaForCard = msg.type === 'media_group' && prevWasCard;
+        const delayMs = thisIsMediaForCard ? 250 : 1100;
+        await new Promise((r) => setTimeout(r, delayMs));
+      }
       const adapter = getChannel(msg.channel);
       let sendResult;
       let errMsg: string | undefined;
