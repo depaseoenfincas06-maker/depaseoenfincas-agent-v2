@@ -13,6 +13,7 @@
 import { z } from 'zod';
 import { stageDecisionSchema, type StageDecision } from '@depf/shared';
 import type { StageHandler, StageInput } from './types.js';
+import { buildToneBlock, withStageAddendum } from './types.js';
 import { getLLM } from '../llm/index.js';
 
 const QA_SYSTEM = `Eres el agente QA de "De Paseo en Fincas". Respondes preguntas puntuales del cliente sobre la empresa, sus servicios, las propiedades en general, ubicaciones, medios de pago, qué incluye, mascotas, etc.
@@ -31,6 +32,7 @@ Información disponible:
 - companyKnowledge: {KNOWLEDGE_JSON}
 - paymentMethods: {PAYMENT_METHODS_JSON}
 - companyDocuments disponibles: {DOCUMENTS_LIST}
+- coverage_zones (zonas que sí atendemos): {COVERAGE_ZONES}
 
 DEBES devolver el JSON exacto con la forma de stageDecisionSchema (el orquestador lo validará).`;
 
@@ -46,16 +48,31 @@ class QAStage implements StageHandler {
 
   async handle(input: StageInput): Promise<StageDecision> {
     const llm = getLLM();
-    const tone = `${input.settings.tonePreset}. ${input.settings.toneGuidelinesExtra ?? ''}`;
+    const tone = buildToneBlock(input.settings);
     const documentsList = input.settings.companyDocuments
       .map((d) => `${d.name}${d.topics?.length ? ` (topics: ${d.topics.join(', ')})` : ''}`)
       .join('; ') || '(ninguno configurado)';
+    // companyKnowledge is now a free-form string in v1; keep tolerance for the
+    // legacy JSON shape so we don't crash on a database row that still has an
+    // object.
+    const knowledgeText =
+      typeof input.settings.companyKnowledge === 'string'
+        ? input.settings.companyKnowledge
+        : JSON.stringify(input.settings.companyKnowledge ?? {}, null, 0);
+    const paymentText =
+      typeof input.settings.paymentMethods === 'string'
+        ? input.settings.paymentMethods
+        : JSON.stringify(input.settings.paymentMethods ?? {}, null, 0);
 
-    const system = QA_SYSTEM.replace('{TONE_GUIDELINES}', tone)
-      .replace('{CURRENT_STAGE}', input.conversation.currentStage)
-      .replace('{KNOWLEDGE_JSON}', JSON.stringify(input.settings.companyKnowledge ?? {}, null, 0))
-      .replace('{PAYMENT_METHODS_JSON}', JSON.stringify(input.settings.paymentMethods ?? {}, null, 0))
-      .replace('{DOCUMENTS_LIST}', documentsList);
+    const system = withStageAddendum(
+      QA_SYSTEM.replace('{TONE_GUIDELINES}', tone)
+        .replace('{CURRENT_STAGE}', input.conversation.currentStage)
+        .replace('{KNOWLEDGE_JSON}', knowledgeText || '(sin información configurada)')
+        .replace('{PAYMENT_METHODS_JSON}', paymentText || '(sin medios de pago configurados)')
+        .replace('{DOCUMENTS_LIST}', documentsList)
+        .replace('{COVERAGE_ZONES}', input.settings.coverageZones ?? '(sin zonas configuradas)'),
+      input.settings.promptAddenda?.qa,
+    );
 
     const history = input.recentMessages
       .slice(0, 8)

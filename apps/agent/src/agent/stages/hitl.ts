@@ -14,9 +14,14 @@ class HITLStage implements StageHandler {
   readonly stage = 'HITL' as const;
 
   async handle(input: StageInput): Promise<StageDecision> {
-    const message =
+    const baseMessage =
       input.settings.handoffMessage ??
       'Ya un asesor humano se está encargando de tu caso, te contactará en breve. ¡Gracias por tu paciencia!';
+    // HITL prompt addendum (rare, but configurable from dashboard) is appended
+    // as additional context after the canonical handoff message. Useful for
+    // adding hours-of-operation info or alternate contact channels.
+    const addendum = input.settings.promptAddenda?.hitl?.trim();
+    const message = addendum ? `${baseMessage}\n\n${addendum}` : baseMessage;
     return {
       intent: 'HITL_REQUEST',
       extractedData: {},

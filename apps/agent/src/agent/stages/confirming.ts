@@ -7,6 +7,7 @@
  */
 import { stageDecisionSchema, type StageDecision } from '@depf/shared';
 import type { StageHandler, StageInput } from './types.js';
+import { buildToneBlock, withStageAddendum } from './types.js';
 import { getLLM } from '../llm/index.js';
 import { getFincaById } from '../../inventory/loader.js';
 import { generateReservationPDF } from '../tools/generate-pdf.js';
@@ -59,16 +60,23 @@ class ConfirmingStage implements StageHandler {
 
   async handle(input: StageInput): Promise<StageDecision> {
     const llm = getLLM();
-    const tone = `${input.settings.tonePreset}. ${input.settings.toneGuidelinesExtra ?? ''}`;
+    const tone = buildToneBlock(input.settings);
     const fincaId = input.conversation.selectedFinca;
     const finca = fincaId ? await getFincaById(fincaId) : null;
     const fincaName = finca?.realName ?? '(finca por confirmar)';
     const reservationSoFar = input.conversation.reservation ?? {};
 
-    const system = CONFIRMING_SYSTEM.replace('{TONE_GUIDELINES}', tone)
-      .replace('{FINCA_NAME}', fincaName)
-      .replace('{RESERVATION_SO_FAR}', JSON.stringify(reservationSoFar))
-      .replace('{PAYMENT_METHODS}', JSON.stringify(input.settings.paymentMethods ?? {}));
+    const paymentText =
+      typeof input.settings.paymentMethods === 'string'
+        ? input.settings.paymentMethods
+        : JSON.stringify(input.settings.paymentMethods ?? {});
+    const system = withStageAddendum(
+      CONFIRMING_SYSTEM.replace('{TONE_GUIDELINES}', tone)
+        .replace('{FINCA_NAME}', fincaName)
+        .replace('{RESERVATION_SO_FAR}', JSON.stringify(reservationSoFar))
+        .replace('{PAYMENT_METHODS}', paymentText),
+      input.settings.promptAddenda?.confirming,
+    );
 
     const history = input.recentMessages
       .slice(0, 10)
@@ -114,7 +122,9 @@ class ConfirmingStage implements StageHandler {
           finca,
           reservation: merged as Record<string, string>,
           searchCriteria: input.conversation.searchCriteria ?? {},
-          paymentMethods: input.settings.paymentMethods ?? {},
+          paymentMethods: (typeof input.settings.paymentMethods === 'object' && input.settings.paymentMethods !== null
+            ? (input.settings.paymentMethods as Record<string, unknown>)
+            : {}),
         });
         outbound.push({
           channel: 'simulator',

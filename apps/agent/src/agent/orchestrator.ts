@@ -126,7 +126,7 @@ export class Orchestrator {
     trace: Trace,
     log: { info: (...args: unknown[]) => void; error: (...args: unknown[]) => void; warn: (...args: unknown[]) => void },
   ): Promise<OrchestratorResult> {
-    // Short-circuit: HITL active → silence
+    // Short-circuit: HITL active → silence (per-conversation)
     if (!conversation.agenteActivo) {
       await trace.finalize({
         stageAfter: conversation.currentStage,
@@ -134,6 +134,19 @@ export class Orchestrator {
         outboundCount: 0,
         status: 'silent',
         silenceReason: 'HITL_ACTIVE',
+      });
+      return { traceId: trace.id, status: 'silent', outboundCount: 0 };
+    }
+
+    // Short-circuit: global bot disabled (master switch from settings)
+    if (settings.globalBotEnabled === false) {
+      log.info({}, 'global bot disabled — silencing this turn');
+      await trace.finalize({
+        stageAfter: conversation.currentStage,
+        intent: null,
+        outboundCount: 0,
+        status: 'silent',
+        silenceReason: 'GLOBAL_BOT_DISABLED',
       });
       return { traceId: trace.id, status: 'silent', outboundCount: 0 };
     }
@@ -356,9 +369,19 @@ export class Orchestrator {
       tone_guidelines_extra: string | null;
       initial_message_template: string | null;
       handoff_message: string | null;
-      company_knowledge: Record<string, unknown>;
+      company_knowledge: unknown;
       company_documents: Array<{ name: string; url?: string; topics?: string[] }>;
-      payment_methods: Record<string, unknown>;
+      payment_methods: unknown;
+      // v1-parity columns (added by migration 0002)
+      prompt_addenda: Record<string, string | null> | null;
+      coverage_zones: string | null;
+      public_app_base_url: string | null;
+      max_properties_to_show: number | null;
+      global_bot_enabled: boolean | null;
+      owner_test_mode: boolean | null;
+      owner_contact_override: string | null;
+      inventory_sheet_id: string | null;
+      inventory_sheet_tab: string | null;
     }>(`SELECT * FROM agent_settings WHERE id = 1`);
     const row = r.rows[0];
     if (!row) throw new Error('agent_settings row not found');
@@ -367,9 +390,18 @@ export class Orchestrator {
       toneGuidelinesExtra: row.tone_guidelines_extra ?? undefined,
       initialMessageTemplate: row.initial_message_template ?? undefined,
       handoffMessage: row.handoff_message ?? undefined,
-      companyKnowledge: row.company_knowledge ?? {},
+      companyKnowledge: (row.company_knowledge ?? {}) as Record<string, unknown> | string,
       companyDocuments: row.company_documents ?? [],
       paymentMethods: row.payment_methods ?? {},
+      promptAddenda: (row.prompt_addenda ?? {}) as AgentSettingsView['promptAddenda'],
+      coverageZones: row.coverage_zones,
+      publicAppBaseUrl: row.public_app_base_url,
+      maxPropertiesToShow: row.max_properties_to_show ?? 3,
+      globalBotEnabled: row.global_bot_enabled ?? true,
+      ownerTestMode: row.owner_test_mode ?? false,
+      ownerContactOverride: row.owner_contact_override,
+      inventorySheetId: row.inventory_sheet_id,
+      inventorySheetTab: row.inventory_sheet_tab,
     };
   }
 

@@ -10,6 +10,7 @@
  */
 import { stageDecisionSchema, type StageDecision } from '@depf/shared';
 import type { StageHandler, StageInput } from './types.js';
+import { buildToneBlock, withStageAddendum } from './types.js';
 import { getLLM } from '../llm/index.js';
 import { executeInventoryTool, INVENTORY_TOOL_DESCRIPTIONS } from '../tools/inventory-reader.js';
 
@@ -17,7 +18,7 @@ const MAX_TOOL_ITERATIONS = 3;
 
 const OFFERING_SYSTEM = `Eres el asistente conversacional de "De Paseo en Fincas". Estás en el estado OFFERING.
 
-OBJETIVO: presentar al cliente hasta 3 fincas que coincidan con sus criterios. Capturar cuál elige.
+OBJETIVO: presentar al cliente hasta {MAX_PROPERTIES} fincas que coincidan con sus criterios. Capturar cuál elige.
 
 REGLAS CRÍTICAS:
 - Tono: {TONE_GUIDELINES}
@@ -54,11 +55,16 @@ class OfferingStage implements StageHandler {
 
   async handle(input: StageInput): Promise<StageDecision> {
     const llm = getLLM();
-    const tone = `${input.settings.tonePreset}. ${input.settings.toneGuidelinesExtra ?? ''}`;
+    const tone = buildToneBlock(input.settings);
     const shownFincas = input.conversation.shownFincas ?? [];
-    const system = OFFERING_SYSTEM.replace('{TONE_GUIDELINES}', tone)
-      .replace('{SEARCH_CRITERIA}', JSON.stringify(input.conversation.searchCriteria ?? {}))
-      .replace('{SHOWN_FINCAS}', JSON.stringify(shownFincas));
+    const maxProps = input.settings.maxPropertiesToShow ?? 3;
+    const system = withStageAddendum(
+      OFFERING_SYSTEM.replace('{TONE_GUIDELINES}', tone)
+        .replace('{SEARCH_CRITERIA}', JSON.stringify(input.conversation.searchCriteria ?? {}))
+        .replace('{SHOWN_FINCAS}', JSON.stringify(shownFincas))
+        .replace('{MAX_PROPERTIES}', String(maxProps)),
+      input.settings.promptAddenda?.offering,
+    );
 
     const baseHistory = input.recentMessages
       .slice(0, 10)

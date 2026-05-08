@@ -50,6 +50,7 @@ export type AgentTurnStatus = 'ok' | 'malformed' | 'timeout' | 'error';
 
 export type SilenceReason =
   | 'HITL_ACTIVE'
+  | 'GLOBAL_BOT_DISABLED'
   | 'OUT_OF_OPERATING_HOURS'
   | 'DUPLICATE_MESSAGE'
   | 'EXPLICITLY_IGNORED';

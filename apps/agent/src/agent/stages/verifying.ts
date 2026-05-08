@@ -11,6 +11,7 @@
  */
 import type { StageDecision } from '@depf/shared';
 import type { StageHandler, StageInput } from './types.js';
+import { sendOwnerMessage } from '../../channels/whatsapp.js';
 import { query } from '../../persistence/db.js';
 import { logger } from '../../observability/logger.js';
 
@@ -40,13 +41,37 @@ class VerifyingStage implements StageHandler {
       };
     }
 
-    // Queue owner notification asynchronously
+    // Queue owner notification + actually send if recipients are configured.
+    // owner_test_mode short-circuits real sending so internal QA doesn't ping
+    // real property owners. owner_contact_override redirects every send to
+    // a single test number (legacy v1 field).
+    const recipientsRaw = (input.conversation.extras as { selectionRecipients?: string[] } | undefined)?.selectionRecipients;
+    const recipients =
+      input.settings.ownerContactOverride && input.settings.ownerContactOverride.trim().length > 0
+        ? [input.settings.ownerContactOverride.trim()]
+        : recipientsRaw ?? [];
+
     await query(
       `INSERT INTO selection_notifications (conversation_id, selected_finca_id, status, payload)
-         VALUES ($1, $2, 'pending', $3::jsonb)
+         VALUES ($1, $2, $3, $4::jsonb)
          ON CONFLICT DO NOTHING`,
-      [input.conversation.waId, selected, JSON.stringify({ stage: 'VERIFYING' })],
+      [
+        input.conversation.waId,
+        selected,
+        input.settings.ownerTestMode ? 'skipped_test_mode' : 'pending',
+        JSON.stringify({ stage: 'VERIFYING', recipients, ownerTestMode: !!input.settings.ownerTestMode }),
+      ],
     );
+
+    if (!input.settings.ownerTestMode && recipients.length > 0) {
+      const text = `Hola, te escribimos de De Paseo en Fincas. Tenemos una nueva solicitud de reserva para ${selected}. ¿Nos confirmas por favor si está disponible?`;
+      for (const phone of recipients) {
+        const r = await sendOwnerMessage(phone, text);
+        if (!r.ok) {
+          logger.warn({ phone, selected }, 'owner whatsapp send failed; notification stays pending');
+        }
+      }
+    }
 
     return {
       intent: 'WAITING_OWNER',

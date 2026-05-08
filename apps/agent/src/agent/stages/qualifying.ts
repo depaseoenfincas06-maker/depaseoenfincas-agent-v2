@@ -9,6 +9,7 @@
 import { stageDecisionSchema } from '@depf/shared';
 import type { StageDecision } from '@depf/shared';
 import type { StageHandler, StageInput } from './types.js';
+import { buildToneBlock, withStageAddendum } from './types.js';
 import { getLLM } from '../llm/index.js';
 
 const QUALIFYING_SYSTEM = `Eres el asistente conversacional de "De Paseo en Fincas", una empresa colombiana que renta fincas vacacionales. Estás en el estado QUALIFYING.
@@ -42,8 +43,11 @@ class QualifyingStage implements StageHandler {
 
   async handle(input: StageInput): Promise<StageDecision> {
     const llm = getLLM();
-    const tone = `${input.settings.tonePreset}. ${input.settings.toneGuidelinesExtra ?? ''}`;
-    const system = QUALIFYING_SYSTEM.replace('{TONE_GUIDELINES}', tone);
+    const tone = buildToneBlock(input.settings);
+    const system = withStageAddendum(
+      QUALIFYING_SYSTEM.replace('{TONE_GUIDELINES}', tone),
+      input.settings.promptAddenda?.qualifying,
+    );
 
     const history = input.recentMessages
       .slice(0, 10)
