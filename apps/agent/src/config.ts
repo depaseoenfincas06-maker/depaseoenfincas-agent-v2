@@ -12,6 +12,11 @@ loadDotenv({ quiet: true });
 const envSchema = z.object({
   NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
   LOG_LEVEL: z.enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace']).default('info'),
+  /**
+   * Render (and most PaaS) inject a $PORT env var the service must bind to.
+   * Locally we use AGENT_HTTP_PORT (default 3200). PORT takes precedence.
+   */
+  PORT: z.coerce.number().int().positive().optional(),
   AGENT_HTTP_PORT: z.coerce.number().int().positive().default(3200),
 
   DATABASE_URL: z.string().min(1),

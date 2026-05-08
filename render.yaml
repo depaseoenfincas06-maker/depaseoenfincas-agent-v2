@@ -15,8 +15,8 @@ services:
     envVars:
       - key: NODE_ENV
         value: production
-      - key: AGENT_HTTP_PORT
-        value: 3200
+      # Render auto-injects PORT (typically 10000). Our server reads PORT
+      # before AGENT_HTTP_PORT, so don't override it here.
       - key: REDIS_URL
         fromService:
           type: redis

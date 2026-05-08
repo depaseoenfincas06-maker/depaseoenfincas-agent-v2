@@ -33,9 +33,13 @@ async function buildServer() {
 
 async function start() {
   const app = await buildServer();
+  // Render / Heroku / Fly inject $PORT — bind to it when present so the
+  // platform's load balancer can reach us. Falls back to AGENT_HTTP_PORT
+  // for local development.
+  const port = config.PORT ?? config.AGENT_HTTP_PORT;
   try {
-    await app.listen({ port: config.AGENT_HTTP_PORT, host: '0.0.0.0' });
-    logger.info({ port: config.AGENT_HTTP_PORT }, 'agent server listening');
+    await app.listen({ port, host: '0.0.0.0' });
+    logger.info({ port }, 'agent server listening');
   } catch (err) {
     logger.error({ err }, 'failed to start server');
     process.exit(1);
